@@ -18,29 +18,33 @@ CachePostDMA() that closes it and reports, as they happen:
 - DMA_Continue without a first CachePreDMA()
 - a new transfer overlapping one that is still outstanding
 - DMA_ReadFromRAM differing between pre and post
+- a post whose address or length is not the transfer's initial one, or
+  that passes DMA_Continue (rules from The MuLib Programmer's Manual)
 - a post past a length the MMU library shortened, without the
   DMA_Continue calls for the rest
 - transfers outstanding for longer than TIMEOUT seconds
-- with STRICT, posts whose address or length differ from the pre
 
-Each report names the caller's PC, resolved through SegTracker, expansion
-ROMs or Kickstart modules where possible, and its task, including whether
+Each report names the caller's PC, resolved through SegTracker, resident
+modules, library/device jump tables (which also names drivers a boot ROM
+relocated into RAM) or expansion ROMs, and its task, including whether
 the call came from an interrupt.
 
 Usage:
-  run cachecop START [SERIAL] [STRICT] [TIMEOUT=n]
+  run cachecop START [SERIAL] [TIMEOUT=n]
   cachecop STATUS      counters, violations, outstanding transfers
   cachecop EVENTS      the last 64 violations in detail
   cachecop RESET       clear counters and the violation log
   cachecop STOP        remove the patches and quit
+  cachecop WHERE addr  name the code at an address (e.g. from a log)
 
 SERIAL also logs every violation to the serial port with RawPutChar(), so
 it survives a crash (and shows up in Sashimi). STATUS and EVENTS return
 WARN when a violation was seen.
 
 dmatest is a test program that makes both correct and deliberately broken
-call sequences. The ADF boots into a self-test: it starts CacheCop, runs
-dmatest ALL and shows the status.
+call sequences; "dmatest DISK <device> [unit]" reads through a real driver
+so its calls can be checked. The ADF boots into a self-test: it starts
+CacheCop, runs dmatest ALL and shows the status.
 
 Source code: https://github.com/reinauer/CacheCop
 License: public domain / Unlicense
