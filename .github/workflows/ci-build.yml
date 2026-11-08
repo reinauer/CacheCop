@@ -50,3 +50,31 @@ jobs:
         name: ${{ steps.files.outputs.lha }}
         path: ${{ steps.files.outputs.lha }}
         if-no-files-found: error
+
+  aminet-check:
+    name: Validate Aminet readme
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download LHA
+      uses: actions/download-artifact@v4
+      with:
+        pattern: cachecop-*.lha
+        merge-multiple: true
+        path: dist
+
+    - name: Name files as for the Aminet upload
+      run: |
+        mv dist/cachecop-*.lha dist/CacheCop.lha
+        cp cachecop.readme dist/CacheCop.readme
+
+    - name: Validate readme
+      uses: sidick/aminet-release-action@v1
+      with:
+        filename: dist/CacheCop.lha
+        readme: dist/CacheCop.readme
+        category: dev/debug
+        validate-only: true
