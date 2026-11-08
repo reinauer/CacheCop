@@ -1,2 +1,6 @@
 cachecop
 *.o
+tests/dmatest
+*.adf
+*.lha
+build/

@@ -19,7 +19,18 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $^
 
-clean:
-	rm -f $(BIN)
+# Test program and a data floppy holding both binaries
+tests/dmatest: tests/dmatest.c
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -Wno-pointer-sign -Wno-discarded-qualifiers -o $@ $^
 
-.PHONY: all clean
+test-adf: $(BIN) tests/dmatest
+	rm -f cachecop-test.adf
+	xdftool cachecop-test.adf create + format CacheCop \
+		+ write $(BIN) + write tests/dmatest \
+		+ makedir S + write tests/Startup-Sequence S/Startup-Sequence \
+		+ boot install
+
+clean:
+	rm -f $(BIN) tests/dmatest cachecop-test.adf
+
+.PHONY: all clean test-adf
