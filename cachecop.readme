@@ -1,4 +1,4 @@
-Short:        Finds unpaired CachePreDMA/CachePostDMA calls
+Short:        Audits CachePreDMA/CachePostDMA usage
 Author:       stepan@coreboot.org (Stefan Reinauer)
 Uploader:     stepan@coreboot.org (Stefan Reinauer)
 Type:         dev/debug
