@@ -1,0 +1,52 @@
+name: CacheCop CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: stefanreinauer/amiga-gcc:gcc-v13.4
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Mark git directory as safe
+      run: git config --global --add safe.directory '*'
+
+    - name: Build program, LHA and ADF
+      run: make all
+
+    - name: Find ADF and LHA filenames
+      id: files
+      run: |
+        echo "adf=$(ls cachecop-*.adf)" >> $GITHUB_OUTPUT
+        echo "lha=$(ls cachecop-*.lha)" >> $GITHUB_OUTPUT
+
+    - name: Archive program
+      uses: actions/upload-artifact@v4
+      with:
+        name: CacheCop Program
+        path: |
+          cachecop
+          tests/dmatest
+        if-no-files-found: error
+
+    - name: Archive ADF
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.files.outputs.adf }}
+        path: ${{ steps.files.outputs.adf }}
+        if-no-files-found: error
+
+    - name: Archive LHA
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.files.outputs.lha }}
+        path: ${{ steps.files.outputs.lha }}
+        if-no-files-found: error

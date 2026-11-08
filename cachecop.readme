@@ -1,0 +1,46 @@
+Short:        Finds unpaired CachePreDMA/CachePostDMA calls
+Author:       stepan@coreboot.org (Stefan Reinauer)
+Uploader:     stepan@coreboot.org (Stefan Reinauer)
+Type:         dev/debug
+Version:      [VERSION]
+Architecture: m68k-amigaos >= 2.0.4
+
+CacheCop watches exec.library's CachePreDMA() and CachePostDMA() and
+reports device drivers that use them wrongly. A driver that prepares a
+buffer for DMA and never calls CachePostDMA() can leave caches or MMU
+state wrong on 68040/68060 systems and with MMU libraries, which is hard
+to trace back to the driver responsible.
+
+CacheCop tracks every transfer from its first CachePreDMA() to the
+CachePostDMA() that closes it and reports, as they happen:
+
+- CachePostDMA() without a matching CachePreDMA()
+- DMA_Continue without a first CachePreDMA()
+- a new transfer overlapping one that is still outstanding
+- DMA_ReadFromRAM differing between pre and post
+- a post past a length the MMU library shortened, without the
+  DMA_Continue calls for the rest
+- transfers outstanding for longer than TIMEOUT seconds
+- with STRICT, posts whose address or length differ from the pre
+
+Each report names the caller's PC, resolved through SegTracker, expansion
+ROMs or Kickstart modules where possible, and its task, including whether
+the call came from an interrupt.
+
+Usage:
+  run cachecop START [SERIAL] [STRICT] [TIMEOUT=n]
+  cachecop STATUS      counters, violations, outstanding transfers
+  cachecop EVENTS      the last 64 violations in detail
+  cachecop RESET       clear counters and the violation log
+  cachecop STOP        remove the patches and quit
+
+SERIAL also logs every violation to the serial port with RawPutChar(), so
+it survives a crash (and shows up in Sashimi). STATUS and EVENTS return
+WARN when a violation was seen.
+
+dmatest is a test program that makes both correct and deliberately broken
+call sequences. The ADF boots into a self-test: it starts CacheCop, runs
+dmatest ALL and shows the status.
+
+Source code: https://github.com/reinauer/CacheCop
+License: public domain / Unlicense

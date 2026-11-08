@@ -1,5 +1,5 @@
 ; CacheCop test floppy: boots, runs the test cases, shows the results.
 ; Uses only Shell built-ins, so it works without a C: directory.
-Run DF0:cachecop START STRICT TIMEOUT=5
-DF0:dmatest ALL
-DF0:cachecop STATUS
+Run SYS:cachecop START STRICT TIMEOUT=5
+SYS:dmatest ALL
+SYS:cachecop STATUS

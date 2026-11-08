@@ -30,7 +30,13 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define CC_VERSION "1.0"
+/* The Makefile passes the git version and build date */
+#ifndef CC_VERSION
+#define CC_VERSION "dev"
+#endif
+#ifndef CC_DATE
+#define CC_DATE "1.1.2026"
+#endif
 
 /*
  * DMA_Continue, DMA_NoModify and DMA_ReadFromRAM come from exec/execbase.h
@@ -48,7 +54,7 @@ extern struct ExecBase *SysBase;
 
 static const char kPortName[] = "CacheCop";
 static const char kVersion[] __attribute__((used)) =
-    "$VER: CacheCop " CC_VERSION " (08.11.2026)";
+    "$VER: CacheCop " CC_VERSION " (" CC_DATE ")";
 
 /* ------------------------------------------------------------------ */
 /* Shared state (written by the hooks, any context)                   */
