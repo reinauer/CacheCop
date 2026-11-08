@@ -63,13 +63,19 @@ static const char kVersion[] __attribute__((used)) =
 #define CC_MAX_XFERS 128
 #define CC_NAMELEN   24
 
+#define CC_WHERESIZE 64
+
 /* Where a call came from */
 struct Caller {
     APTR         pc;       /* return address of the CachePre/PostDMA() call */
     struct Task *task;     /* SysBase->ThisTask at the time */
     UBYTE        inint;    /* stack pointer was outside the task's stack */
-    UBYTE        pad;
+    UBYTE        resolved; /* where[] is filled in (empty if unknown) */
     char         name[CC_NAMELEN];  /* task or CLI command name */
+    /* What code pc belongs to. The hooks can't look this up (they may run
+       in an interrupt), so the daemon fills it in soon after, while the
+       code is still loaded. */
+    char         where[CC_WHERESIZE];
 };
 
 /* One DMA transfer, from its first CachePreDMA() to its CachePostDMA() */
@@ -212,6 +218,8 @@ static void capture_caller(struct Caller *c, APTR pc, APTR sp)
     c->pc = pc;
     c->task = t;
     c->name[0] = '\0';
+    c->resolved = 0;
+    c->where[0] = '\0';
     if (!t) {
         c->inint = 1;
         return;
@@ -603,7 +611,7 @@ static BOOL in_kickstart(APTR pc)
            (a >= 0xE00000UL && a < 0xE80000UL);      /* extended ROM */
 }
 
-static BOOL where_resident(char *buf, APTR pc)
+static BOOL where_resident(char *buf, APTR pc, BOOL guess)
 {
     ULONG *rm = (ULONG *)SysBase->ResModules;
     struct Resident *best = NULL;
@@ -622,11 +630,69 @@ static BOOL where_resident(char *buf, APTR pc)
     }
     if (!best || !best->rt_Name)
         return FALSE;
-    if (pc >= best->rt_EndSkip && !(in_kickstart(pc) && in_kickstart(best)))
+    if (pc >= best->rt_EndSkip &&
+        !(guess && in_kickstart(pc) && in_kickstart(best)))
         return FALSE;
     copy_tail(tmp, best->rt_Name, CC_WHERELEN - 16);
     fmt(buf, "%s+$%lx%s", (ULONG)tmp, (ULONG)((UBYTE *)pc - (UBYTE *)best),
         (ULONG)(pc >= best->rt_EndSkip ? "?" : ""));
+    return TRUE;
+}
+
+/*
+ * Libraries, devices and resources: find the jump table entry whose target
+ * is closest below pc (within 64K) and report the LVO. This names drivers
+ * that neither SegTracker nor the resident list know about, such as ones
+ * a boot ROM relocated into RAM. A routine without its own LVO is reported
+ * relative to the nearest one that precedes it.
+ */
+static void scan_vectors(struct List *list, APTR pc, struct Library **best,
+                         ULONG *bestTarget, LONG *bestLVO)
+{
+    struct Node *n;
+
+    for (n = list->lh_Head; n->ln_Succ; n = n->ln_Succ) {
+        struct Library *lib = (struct Library *)n;
+        UWORD i, count = lib->lib_NegSize / 6;
+
+        for (i = 1; i <= count; i++) {
+            UBYTE *v = (UBYTE *)lib - 6 * i;
+            ULONG target;
+
+            if (*(UWORD *)v != 0x4EF9)          /* JMP abs.l */
+                continue;
+            target = *(ULONG *)(v + 2);
+            /* Our own patches would claim whatever follows our code */
+            if (target == (ULONG)cc_PreStub || target == (ULONG)cc_PostStub)
+                continue;
+            if (target <= (ULONG)pc && (ULONG)pc - target < 0x10000UL &&
+                (!*best || target > *bestTarget)) {
+                *best = lib;
+                *bestTarget = target;
+                *bestLVO = -6 * (LONG)i;
+            }
+        }
+    }
+}
+
+static BOOL where_library(char *buf, APTR pc)
+{
+    struct Library *best = NULL;
+    ULONG target = 0;
+    LONG lvo = 0;
+    char tmp[CC_WHERELEN];
+
+    Forbid();
+    scan_vectors(&SysBase->DeviceList, pc, &best, &target, &lvo);
+    scan_vectors(&SysBase->LibList, pc, &best, &target, &lvo);
+    scan_vectors(&SysBase->ResourceList, pc, &best, &target, &lvo);
+    if (best)
+        copy_tail(tmp, best->lib_Node.ln_Name ? best->lib_Node.ln_Name : "?",
+                  CC_WHERELEN - 20);
+    Permit();
+    if (!best)
+        return FALSE;
+    fmt(buf, "%s LVO%ld+$%lx", (ULONG)tmp, lvo, (ULONG)pc - target);
     return TRUE;
 }
 
@@ -651,11 +717,17 @@ static BOOL where_board(char *buf, APTR pc)
     return FALSE;
 }
 
-/* Describe the code at pc, or return FALSE if nothing claims it */
+/*
+ * Describe the code at pc, or return FALSE if nothing claims it. Most
+ * reliable first: SegTracker, then a resident module that contains pc,
+ * then the nearest library/device entry point, an expansion ROM, and
+ * finally the Kickstart module preceding pc.
+ */
 static BOOL where_is(char *buf, APTR pc)
 {
-    return where_segtracker(buf, pc) || where_board(buf, pc) ||
-           where_resident(buf, pc);
+    return where_segtracker(buf, pc) || where_resident(buf, pc, FALSE) ||
+           where_library(buf, pc) || where_board(buf, pc) ||
+           where_resident(buf, pc, TRUE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -685,12 +757,24 @@ static void flags_str(char *buf, ULONG flags)
     buf[3] = '\0';
 }
 
+/* Name the caller's code once; call from task context only */
+static void resolve(struct Caller *c)
+{
+    if (c->resolved)
+        return;
+    if (!where_is(c->where, c->pc))
+        c->where[0] = '\0';
+    c->resolved = 1;
+}
+
 static void fmt_caller(char *buf, const struct Caller *c)
 {
-    char where[CC_WHERELEN + 4];
+    char where[CC_WHERESIZE + 4];
 
     where[0] = '\0';
-    if (where_is(where + 2, c->pc)) {
+    if (c->resolved ? c->where[0] != '\0' : where_is(where + 2, c->pc)) {
+        if (c->resolved)
+            strcpy(where + 2, c->where);
         where[0] = ' ';
         where[1] = '(';
         strcat(where, ")");
@@ -737,7 +821,7 @@ static void fmt_event(char *buf, const struct Event *ev)
 /* Control messages                                                   */
 /* ------------------------------------------------------------------ */
 
-#define CC_MAGIC 0x43437033UL   /* 'CCp3': bump when the layout changes */
+#define CC_MAGIC 0x43437034UL   /* 'CCp4': bump when the layout changes */
 
 enum {
     CC_CMD_STATUS = 1,
@@ -828,12 +912,48 @@ static void out_line(const char *buf)
         cc_SerPutStr(buf);
 }
 
+/* Name the callers of outstanding transfers that aren't named yet */
+static void resolve_xfers(void)
+{
+    ULONG i;
+
+    for (i = 0; i < CC_MAX_XFERS; i++) {
+        struct Xfer *x = &g_Xfers[i];
+        struct Caller c;
+        APTR start = NULL;
+        ULONG t0 = 0;
+        BOOL need;
+
+        Disable();
+        need = x->used && !x->who.resolved;
+        if (need) {
+            c = x->who;
+            start = x->start;
+            t0 = x->t0;
+        }
+        Enable();
+        if (!need)
+            continue;
+
+        resolve(&c);
+
+        Disable();
+        /* Unless the slot was reused for another transfer meanwhile */
+        if (x->used && !x->who.resolved && x->start == start && x->t0 == t0 &&
+            x->who.pc == c.pc) {
+            strcpy(x->who.where, c.where);
+            x->who.resolved = 1;
+        }
+        Enable();
+    }
+}
+
 /* Print events emitted since the last call */
 static void drain_events(void)
 {
     char buf[CC_LINELEN];
     struct Event ev;
-    ULONG lost;
+    ULONG lost, n;
 
     for (;;) {
         Disable();
@@ -846,8 +966,19 @@ static void drain_events(void)
             Enable();
             break;
         }
-        ev = g_Events[g_EvPrinted % CC_MAX_EVENTS];
-        g_EvPrinted++;
+        n = g_EvPrinted++;
+        ev = g_Events[n % CC_MAX_EVENTS];
+        Enable();
+
+        /* Name the code now, while it's loaded, and keep that for EVENTS */
+        resolve(&ev.who);
+        if (ev.hasXfer)
+            resolve(&ev.xfer.who);
+        Disable();
+        if (g_EvSeq - n <= CC_MAX_EVENTS) {     /* not overwritten yet */
+            g_Events[n % CC_MAX_EVENTS].who = ev.who;
+            g_Events[n % CC_MAX_EVENTS].xfer.who = ev.xfer.who;
+        }
         Enable();
 
         if (lost) {
@@ -948,11 +1079,14 @@ static VOID loop_until_stop(struct Timer *timer)
             g_StopRequested = TRUE;
         if ((sigs & timersig) && timer_tick(timer)) {
             g_Now++;
+            resolve_xfers();
             if (check_stale())
                 drain_events();
         }
-        if (sigs & g_EvSigMask)
+        if (sigs & g_EvSigMask) {
             drain_events();
+            resolve_xfers();
+        }
         if (sigs & portsig) {
             struct CCMsg *m;
             while ((m = (struct CCMsg *)GetMsg(g_Port)) != NULL) {
