@@ -60,9 +60,9 @@ static ULONG g_totalStarts = 0;
 static ULONG g_totalPosts = 0;
 static ULONG g_postsWithoutStart = 0;
 
-/* Old function vectors */
-static APTR g_OldCachePreDMA = NULL;
-static APTR g_OldCachePostDMA = NULL;
+/* Old function vectors (referenced from stubs.s) */
+APTR g_OldPre = NULL;
+APTR g_OldPost = NULL;
 
 /* Control port */
 static struct MsgPort *g_Port = NULL;
@@ -90,75 +90,59 @@ static inline void cc_dec_active(void)
     Permit();
 }
 
-/* Bridge to original vectors — ensure a6=SysBase is set for libcall ABI */
-static ULONG call_old_pre(APTR addr, ULONG len, ULONG flags)
-{
-    register APTR a0 __asm("a0") = addr;
-    register ULONG d0in __asm("d0") = len;
-    register ULONG d1in __asm("d1") = flags;
-    register struct ExecBase *a6 __asm("a6") = SysBase;
-    register ULONG d0out __asm("d0");
-    __asm volatile ("jsr (%2)"
-                    : "=d"(d0out)
-                    : "a"(a6), "a"(g_OldCachePreDMA), "a"(a0), "d"(d0in), "d"(d1in)
-                    : "cc","memory");
-    return d0out;
-}
+/*
+ * Entry stubs live in stubs.s. They pass a0/a1/d0/a6 through to the original
+ * vectors untouched and call the hooks below with a pointer to this frame.
+ * Keep the layout in sync with stubs.s.
+ */
+struct DMAFrame {
+    ULONG  flags;   /* d0 */
+    APTR   addr;    /* a0 */
+    ULONG *lenp;    /* a1 */
+    ULONG  len;     /* *lenp at entry */
+    APTR   pc;      /* caller's return address */
+};
 
-static VOID call_old_post(APTR addr, ULONG len, ULONG flags)
-{
-    register APTR a0 __asm("a0") = addr;
-    register ULONG d0in __asm("d0") = len;
-    register ULONG d1in __asm("d1") = flags;
-    register struct ExecBase *a6 __asm("a6") = SysBase;
-    __asm volatile ("jsr (%2)"
-                    :
-                    : "a"(a6), "a"(g_OldCachePostDMA), "a"(a0), "d"(d0in), "d"(d1in)
-                    : "cc","memory");
-}
+extern UBYTE cc_PreStub[], cc_PostStub[];
+void cc_pre_hook(struct DMAFrame *f, APTR phys);
+void cc_post_hook(struct DMAFrame *f);
 
-/* Replacement vectors — libcall ABI */
-ULONG CacheCop_CachePreDMA(register APTR addr __asm("a0"),
-                           register ULONG len __asm("d0"),
-                           register ULONG flags __asm("d1"))
+void cc_pre_hook(struct DMAFrame *f, APTR phys)
 {
-    if ((flags & DMAF_Continue) == 0) {
+    (void)phys;
+    if ((f->flags & DMAF_Continue) == 0)
         cc_inc_active();
-    }
-    return call_old_pre(addr, len, flags);
 }
 
-VOID CacheCop_CachePostDMA(register APTR addr __asm("a0"),
-                           register ULONG len __asm("d0"),
-                           register ULONG flags __asm("d1"))
+void cc_post_hook(struct DMAFrame *f)
 {
+    (void)f;
     cc_dec_active();
-    call_old_post(addr, len, flags);
 }
 
 /* Patch/unpatch helpers */
 static BOOL install_patches(void)
 {
-    if (!g_OldCachePreDMA) {
-        g_OldCachePreDMA = SetFunction((struct Library *)SysBase, LVOCachePreDMA, (APTR)CacheCop_CachePreDMA);
-        if (!g_OldCachePreDMA) return FALSE;
+    if (!g_OldPre) {
+        g_OldPre = SetFunction((struct Library *)SysBase, LVOCachePreDMA, (APTR)cc_PreStub);
+        if (!g_OldPre) return FALSE;
     }
-    if (!g_OldCachePostDMA) {
-        g_OldCachePostDMA = SetFunction((struct Library *)SysBase, LVOCachePostDMA, (APTR)CacheCop_CachePostDMA);
-        if (!g_OldCachePostDMA) return FALSE;
+    if (!g_OldPost) {
+        g_OldPost = SetFunction((struct Library *)SysBase, LVOCachePostDMA, (APTR)cc_PostStub);
+        if (!g_OldPost) return FALSE;
     }
     return TRUE;
 }
 
 static VOID remove_patches(void)
 {
-    if (g_OldCachePreDMA) {
-        SetFunction((struct Library *)SysBase, LVOCachePreDMA, g_OldCachePreDMA);
-        g_OldCachePreDMA = NULL;
+    if (g_OldPre) {
+        SetFunction((struct Library *)SysBase, LVOCachePreDMA, g_OldPre);
+        g_OldPre = NULL;
     }
-    if (g_OldCachePostDMA) {
-        SetFunction((struct Library *)SysBase, LVOCachePostDMA, g_OldCachePostDMA);
-        g_OldCachePostDMA = NULL;
+    if (g_OldPost) {
+        SetFunction((struct Library *)SysBase, LVOCachePostDMA, g_OldPost);
+        g_OldPost = NULL;
     }
 }
 

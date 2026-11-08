@@ -11,7 +11,7 @@ ifneq ($(NDK),)
   CFLAGS += -I$(NDK)
 endif
 
-SRC := cachecop.c
+SRC := cachecop.c stubs.s
 BIN := cachecop
 
 all: $(BIN)
