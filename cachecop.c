@@ -56,27 +56,32 @@ APTR g_OldPost = NULL;
 static struct MsgPort *g_Port = NULL;
 static BOOL g_StopRequested = FALSE;
 
-/* Utility: atomic-ish inc/dec under Forbid/Permit to avoid task switching races */
+/*
+ * The hooks may run in interrupt context (some drivers call CachePreDMA()/
+ * CachePostDMA() from their interrupt servers). Forbid() only stops task
+ * switches, not interrupts, so it can't protect the counters from a hook
+ * that runs in an interrupt. Disable()/Enable() can, and is legal there.
+ */
 static inline void cc_inc_active(void)
 {
-    Forbid();
+    Disable();
     g_activeDMAs++;
     if ((ULONG)g_activeDMAs > g_maxActive)
         g_maxActive = (ULONG)g_activeDMAs;
     g_totalStarts++;
-    Permit();
+    Enable();
 }
 
 static inline void cc_dec_active(void)
 {
-    Forbid();
+    Disable();
     if (g_activeDMAs > 0) {
         g_activeDMAs--;
     } else {
         g_postsWithoutStart++;
     }
     g_totalPosts++;
-    Permit();
+    Enable();
 }
 
 /*
@@ -164,13 +169,13 @@ static VOID handle_cmd(struct CCMsg *m)
             m->postsWithoutStart = g_postsWithoutStart;
             break;
         case CC_CMD_RESET:
-            Forbid();
+            Disable();
             g_activeDMAs = 0;
             g_maxActive = 0;
             g_totalStarts = 0;
             g_totalPosts = 0;
             g_postsWithoutStart = 0;
-            Permit();
+            Enable();
             break;
         case CC_CMD_STOP:
             g_StopRequested = TRUE;
