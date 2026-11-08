@@ -1,7 +1,7 @@
 /*
  * CacheCop — CachePreDMA/PostDMA auditor for AmigaOS
  *
- * Increments on CachePreDMA without DMAF_Continue; decrements on every
+ * Increments on CachePreDMA without DMA_Continue; decrements on every
  * CachePostDMA. Use STATUS/RESET/STOP via a public message port.
  */
 
@@ -23,29 +23,17 @@
 #define Stricmp stricmp
 #endif
 
-#ifndef DMAF_Continue
-#include <exec/io.h>
+/*
+ * DMA_Continue, DMA_NoModify and DMA_ReadFromRAM come from exec/execbase.h
+ * (V37+). DMA_Continue is (1L<<1); 0x4 is DMA_NoModify.
+ */
+#ifndef DMA_Continue
+#error "DMA_Continue not defined: point NDK= at an NDK 3.1+ include directory"
 #endif
 
-/* Fallback for NDKs without this MMULib-defined flag. */
-#ifndef DMAF_Continue
-#define DMAF_Continue 0x00000004UL
-#endif
-
-#ifndef LVOCachePreDMA
-#include <inline/exec.h>
-#endif
-
-/* If LVO macros are absent, derive from inline/exec.h offsets:
-   - CachePreDMA uses offs 0x2fa
-   - CachePostDMA uses offs 0x300
-   SetFunction expects negative LVO offsets. */
-#if !defined(LVOCachePreDMA)
-#define LVOCachePreDMA  (-0x2fa)
-#endif
-#if !defined(LVOCachePostDMA)
-#define LVOCachePostDMA (-0x300)
-#endif
+/* exec.library LVOs (see inline/exec.h: jsr a6@(-762) / a6@(-768)) */
+#define LVOCachePreDMA  (-762)
+#define LVOCachePostDMA (-768)
 
 /* Our ExecBase in a6 for libcall stubs */
 extern struct ExecBase *SysBase;
@@ -110,7 +98,7 @@ void cc_post_hook(struct DMAFrame *f);
 void cc_pre_hook(struct DMAFrame *f, APTR phys)
 {
     (void)phys;
-    if ((f->flags & DMAF_Continue) == 0)
+    if ((f->flags & DMA_Continue) == 0)
         cc_inc_active();
 }
 
