@@ -69,7 +69,7 @@ static inline void cc_inc_active(void)
 {
     Disable();
     g_activeDMAs++;
-    if ((ULONG)g_activeDMAs > g_maxActive)
+    if (g_activeDMAs > 0 && (ULONG)g_activeDMAs > g_maxActive)
         g_maxActive = (ULONG)g_activeDMAs;
     g_totalStarts++;
     Enable();
@@ -78,11 +78,10 @@ static inline void cc_inc_active(void)
 static inline void cc_dec_active(void)
 {
     Disable();
-    if (g_activeDMAs > 0) {
-        g_activeDMAs--;
-    } else {
+    /* Not clamped: a negative value means more posts than starts. */
+    if (g_activeDMAs <= 0)
         g_postsWithoutStart++;
-    }
+    g_activeDMAs--;
     g_totalPosts++;
     Enable();
 }
@@ -204,11 +203,14 @@ static VOID handle_cmd(struct CCMsg *m)
 {
     switch (m->cmd) {
         case CC_CMD_STATUS:
+            /* Snapshot all counters at once so they agree with each other */
+            Disable();
             m->active = g_activeDMAs;
             m->maxActive = g_maxActive;
             m->totalStarts = g_totalStarts;
             m->totalPosts = g_totalPosts;
             m->postsWithoutStart = g_postsWithoutStart;
+            Enable();
             break;
         case CC_CMD_RESET:
             Disable();
@@ -247,64 +249,59 @@ static VOID loop_until_stop(void)
     }
 }
 
-/* Client-side helpers to send a command to a running instance */
+/* Client side: is a daemon running? */
 static struct MsgPort *find_daemon(void)
 {
     return FindPort(kPortName);
 }
 
-static VOID print_status(void)
+/*
+ * Send a command to the running instance and wait for the reply. The port
+ * lookup and PutMsg() happen under Forbid() so the daemon can't remove its
+ * port in between.
+ */
+static BOOL send_cmd(struct CCMsg *msg, ULONG cmd)
 {
-    struct MsgPort *port = find_daemon();
-    if (!port) {
-        Printf((CONST_STRPTR)"CacheCop: not running.\n");
-        return;
-    }
-    struct MsgPort *reply = CreateMsgPort();
+    struct MsgPort *reply, *port;
+
+    reply = CreateMsgPort();
     if (!reply) {
         Printf((CONST_STRPTR)"CacheCop: cannot create reply port.\n");
-        return;
+        return FALSE;
     }
-    struct CCMsg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg.mn_ReplyPort = reply;
-    msg.msg.mn_Length = sizeof(msg);
-    msg.cmd = CC_CMD_STATUS;
-    PutMsg(port, (struct Message *)&msg);
-    WaitPort(reply);
-    (void)GetMsg(reply);
-    DeleteMsgPort(reply);
+    memset(msg, 0, sizeof(*msg));
+    msg->msg.mn_ReplyPort = reply;
+    msg->msg.mn_Length = sizeof(*msg);
+    msg->cmd = cmd;
 
-    /* Print values returned by daemon */
-    Printf((CONST_STRPTR)"CacheCop status:\n");
-    Printf((CONST_STRPTR)"  active: %ld\n", (LONG)msg.active);
-    Printf((CONST_STRPTR)"  maxActive: %ld\n", (LONG)msg.maxActive);
-    Printf((CONST_STRPTR)"  totalStarts: %ld\n", (LONG)msg.totalStarts);
-    Printf((CONST_STRPTR)"  totalPosts: %ld\n", (LONG)msg.totalPosts);
-    Printf((CONST_STRPTR)"  postsWithoutStart: %ld\n", (LONG)msg.postsWithoutStart);
+    Forbid();
+    port = find_daemon();
+    if (port)
+        PutMsg(port, &msg->msg);
+    Permit();
+
+    if (port) {
+        WaitPort(reply);
+        (void)GetMsg(reply);
+    } else {
+        Printf((CONST_STRPTR)"CacheCop: not running.\n");
+    }
+    DeleteMsgPort(reply);
+    return port != NULL;
 }
 
-static VOID send_cmd(ULONG cmd)
+static VOID print_status(void)
 {
-    struct MsgPort *port = find_daemon();
-    if (!port) {
-        Printf((CONST_STRPTR)"CacheCop: not running.\n");
-        return;
-    }
-    struct MsgPort *reply = CreateMsgPort();
-    if (!reply) {
-        Printf((CONST_STRPTR)"CacheCop: cannot create reply port.\n");
-        return;
-    }
     struct CCMsg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg.mn_ReplyPort = reply;
-    msg.msg.mn_Length = sizeof(msg);
-    msg.cmd = cmd;
-    PutMsg(port, (struct Message *)&msg);
-    WaitPort(reply);
-    (void)GetMsg(reply);
-    DeleteMsgPort(reply);
+
+    if (!send_cmd(&msg, CC_CMD_STATUS))
+        return;
+    Printf((CONST_STRPTR)"CacheCop status:\n");
+    Printf((CONST_STRPTR)"  active: %ld\n", msg.active);
+    Printf((CONST_STRPTR)"  maxActive: %lu\n", msg.maxActive);
+    Printf((CONST_STRPTR)"  totalStarts: %lu\n", msg.totalStarts);
+    Printf((CONST_STRPTR)"  totalPosts: %lu\n", msg.totalPosts);
+    Printf((CONST_STRPTR)"  postsWithoutStart: %lu\n", msg.postsWithoutStart);
 }
 
 static VOID usage(void)
@@ -362,13 +359,13 @@ int main(int argc, char **argv)
     }
 
     if (Stricmp(argv[1], "reset") == 0) {
-        send_cmd(CC_CMD_RESET);
-        return RETURN_OK;
+        struct CCMsg msg;
+        return send_cmd(&msg, CC_CMD_RESET) ? RETURN_OK : RETURN_WARN;
     }
 
     if (Stricmp(argv[1], "stop") == 0) {
-        send_cmd(CC_CMD_STOP);
-        return RETURN_OK;
+        struct CCMsg msg;
+        return send_cmd(&msg, CC_CMD_STOP) ? RETURN_OK : RETURN_WARN;
     }
 
     usage();

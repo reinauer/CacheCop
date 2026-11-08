@@ -16,7 +16,7 @@ A practical way to detect misuse of the CachePreDMA/PostDMA API that can leave c
   `SetFunction()`.
 - Maintains global counters:
   - active: number of outstanding DMA transfers (starts without `DMA_Continue` minus completed posts)
-  - postsWithoutStart: `CachePostDMA` seen when `active == 0`
+  - postsWithoutStart: `CachePostDMA` seen when `active <= 0`
   - maxActive: peak concurrent active value
   - totalStarts / totalPosts
 - Runs as a small resident process with a public port `"CacheCop"` for control.
