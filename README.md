@@ -19,7 +19,8 @@ A practical way to detect misuse of the CachePreDMA/PostDMA API that can leave c
   - postsWithoutStart: `CachePostDMA` seen when `active <= 0`
   - maxActive: peak concurrent active value
   - totalStarts / totalPosts
-- Runs as a small resident process with a public port `"CacheCop"` for control.
+- Runs in the foreground with a public port `"CacheCop"` for control. Use
+  `run cachecop start` to keep the shell free.
 
 ## Commands
 - `cachecop start`  — install patches and run until `stop` or CTRL-C
@@ -29,23 +30,24 @@ A practical way to detect misuse of the CachePreDMA/PostDMA API that can leave c
 
 ## Build
 - Requires AmigaOS NDK 3.1+ (or 3.2+) includes (for LVOs and flag definitions).
-- Tested build recipes (pick one and adjust paths):
+- Builds with Bebbo's m68k-amigaos-gcc. The patch stubs in `stubs.s` use GNU
+  as syntax, so vbcc would need them ported to vasm.
 
-  - GCC (m68k-amigaos / Bebbo):
-    m68k-amigaos-gcc -O2 -noixemul -I/path/to/NDK/Include/include_h \
-      -o cachecop src/cachecop.c
+      make NDK=/path/to/NDK/Include/include_h
 
-  - vbcc:
-    vc +ami -O2 -I/path/to/NDK/Include/include_h -o cachecop src/cachecop.c
+  or by hand:
+
+      m68k-amigaos-gcc -O2 -noixemul -I/path/to/NDK/Include/include_h \
+        -o cachecop cachecop.c stubs.s
 
 ## Notes
 - `DMA_Continue` (`1<<1`), `DMA_NoModify` and `DMA_ReadFromRAM` come from
   `exec/execbase.h` in any NDK 3.1+.
-- By default, only `exec.library` is patched. You can optionally enable
-  patching of `mmu.library` by defining `CACHECOP_PATCH_MMULIB` at compile time,
-  provided you have proper headers for mmu.library (protos/LVOs) available.
-- The wrappers are careful to preserve and pass through registers so original
+- Only `exec.library` is patched.
+- The entry stubs pass a0/a1/d0/a6 through untouched, so original
   behaviour and return values are unchanged.
+- `cachecop stop` refuses to remove the patches if another program has
+  patched the same vectors after CacheCop; remove that program first.
 
 ## Limitations
 - This utility observes call pairing but does not verify flag mismatches (e.g.
