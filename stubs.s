@@ -70,3 +70,33 @@ _cc_PostStub:
         move.l  _g_OldPost,-(sp)
         subq.l  #1,_g_InFlight          | the original returns to our caller
         rts                             | tail-jump to original
+
+| RawDoFmt() PutChProc: store the character at (a3)+.
+        .globl  _cc_StuffChar
+_cc_StuffChar:
+        move.b  d0,(a3)+
+        rts
+
+| void cc_SerPutStr(const char *s): write s with exec's private RawPutChar()
+| (LVO -516), turning \n into \r\n. Works without serial.device; Sashimi and
+| similar tools pick it up too.
+        .globl  _cc_SerPutStr
+_cc_SerPutStr:
+        movem.l a2/a6,-(sp)
+        movea.l 12(sp),a2
+        movea.l _SysBase,a6
+.Lser_loop:
+        moveq   #0,d0
+        move.b  (a2)+,d0
+        beq.s   .Lser_done
+        cmp.b   #10,d0
+        bne.s   .Lser_put
+        moveq   #13,d0
+        jsr     -516(a6)
+        moveq   #10,d0
+.Lser_put:
+        jsr     -516(a6)
+        bra.s   .Lser_loop
+.Lser_done:
+        movem.l (sp)+,a2/a6
+        rts

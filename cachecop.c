@@ -23,6 +23,7 @@
 #include <proto/dos.h>
 
 #include <string.h>
+#include <stdarg.h>
 
 #define CC_VERSION "1.0"
 
@@ -73,19 +74,69 @@ struct Xfer {
     struct Caller who;     /* caller of the first call */
 };
 
+/* Violations, reported as they happen */
+enum {
+    EV_NONE,
+    EV_POST_UNMATCHED,     /* CachePostDMA() that matches no transfer */
+    EV_CONT_UNMATCHED,     /* DMA_Continue that matches no transfer */
+    EV_OVERLAP,            /* new transfer overlaps an outstanding one */
+    EV_DIRECTION,          /* DMA_ReadFromRAM differs between pre and post */
+    EV_SHORT_IGNORED,      /* shortened grant posted in full, no continue */
+    EV_LENGTH,             /* STRICT: post length differs from pre */
+    EV_INSIDE,             /* STRICT: post address isn't the start */
+    EV_TABLE_FULL,         /* transfer table overflowed */
+    EV_COUNT
+};
+
+static const char *const kEventNames[EV_COUNT] = {
+    "",
+    "CachePostDMA() without CachePreDMA()",
+    "DMA_Continue without a first CachePreDMA()",
+    "CachePreDMA() overlaps an outstanding transfer",
+    "DMA_ReadFromRAM differs between pre and post",
+    "posted past a shortened grant without DMA_Continue",
+    "post length differs from pre",
+    "post address is not the transfer start",
+    "transfer table full, later starts untracked",
+};
+
+struct Event {
+    UBYTE  type;
+    UBYTE  hasXfer;        /* xfer below is valid */
+    UWORD  pad;
+    ULONG  t;              /* g_Now */
+    APTR   addr;           /* the offending call's arguments */
+    ULONG  len;
+    ULONG  flags;
+    struct Caller who;     /* the offending call */
+    struct Xfer xfer;      /* the transfer it relates to */
+};
+
+#define CC_MAX_EVENTS 64
+
 struct Stats {
     LONG  active;          /* transfers currently in the table */
     ULONG maxActive;
     ULONG starts;          /* CachePreDMA() without DMA_Continue */
     ULONG continues;       /* CachePreDMA() with DMA_Continue */
     ULONG posts;           /* CachePostDMA() */
-    ULONG unmatchedPosts;  /* CachePostDMA() matching no transfer */
-    ULONG unmatchedConts;  /* DMA_Continue matching no transfer */
     ULONG untracked;       /* starts dropped because the table was full */
+    ULONG events[EV_COUNT];
 };
 
 static struct Xfer  g_Xfers[CC_MAX_XFERS];
 static struct Stats g_Stats;
+
+/* Event ring: entry n lives at g_Events[n % CC_MAX_EVENTS] */
+static struct Event g_Events[CC_MAX_EVENTS];
+static ULONG g_EvSeq;                  /* events ever emitted */
+
+/* Who to Signal() when an event is emitted */
+static struct Task *g_DaemonTask;
+static ULONG g_EvSigMask;
+
+/* Options */
+static BOOL g_Strict;
 
 /* Seconds since "cachecop start", advanced by the daemon's timer */
 static volatile ULONG g_Now;
@@ -234,19 +285,65 @@ static struct Xfer *find_post(APTR addr)
     return inside;
 }
 
+/* Any outstanding transfer overlapping [addr, addr + len) */
+static struct Xfer *find_overlap(APTR addr, ULONG len)
+{
+    UBYTE *a = addr, *e = a + len;
+    ULONG i;
+
+    if (!len)
+        return NULL;
+    for (i = 0; i < CC_MAX_XFERS; i++) {
+        struct Xfer *x = &g_Xfers[i];
+        UBYTE *s = x->start;
+        if (x->used && a < s + x->reqlen && s < e)
+            return x;
+    }
+    return NULL;
+}
+
+/* Record an event; call under Disable(). The daemon is signalled later. */
+static void emit(UBYTE type, const struct DMAFrame *f, ULONG len,
+                 const struct Caller *who, const struct Xfer *x)
+{
+    struct Event *ev = &g_Events[g_EvSeq % CC_MAX_EVENTS];
+
+    ev->type = type;
+    ev->t = g_Now;
+    ev->addr = f->addr;
+    ev->len = len;
+    ev->flags = f->flags;
+    ev->who = *who;
+    ev->hasXfer = x != NULL;
+    if (x)
+        ev->xfer = *x;
+    g_EvSeq++;
+    g_Stats.events[type]++;
+}
+
+static void wake_daemon(void)
+{
+    if (g_DaemonTask)
+        Signal(g_DaemonTask, g_EvSigMask);
+}
+
 void cc_pre_hook(struct DMAFrame *f, APTR phys)
 {
     struct Caller who;
     struct Xfer *x;
-    ULONG granted;
+    ULONG granted, seq;
 
     (void)phys;
     capture_caller(&who, f->pc, f);
     granted = f->lenp ? *f->lenp : 0;
 
     Disable();
+    seq = g_EvSeq;
     if ((f->flags & DMA_Continue) == 0) {
         g_Stats.starts++;
+        x = find_overlap(f->addr, f->len);
+        if (x)
+            emit(EV_OVERLAP, f, f->len, &who, x);
         x = alloc_xfer();
         if (x) {
             x->used = 1;
@@ -261,7 +358,9 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
             if ((ULONG)g_Stats.active > g_Stats.maxActive)
                 g_Stats.maxActive = (ULONG)g_Stats.active;
         } else {
-            g_Stats.untracked++;
+            /* Report the first overflow only, not every start after it */
+            if (g_Stats.untracked++ == 0)
+                emit(EV_TABLE_FULL, f, f->len, &who, NULL);
         }
     } else {
         g_Stats.continues++;
@@ -271,28 +370,53 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
             if ((UBYTE *)f->addr == (UBYTE *)x->start + x->covered)
                 x->covered += granted;
         } else {
-            g_Stats.unmatchedConts++;
+            emit(EV_CONT_UNMATCHED, f, f->len, &who, NULL);
         }
     }
+    seq = g_EvSeq - seq;
     Enable();
+
+    if (seq)
+        wake_daemon();
 }
 
 void cc_post_hook(struct DMAFrame *f)
 {
+    struct Caller who;
     struct Xfer *x;
+    ULONG seq;
+
+    capture_caller(&who, f->pc, f);
 
     Disable();
+    seq = g_EvSeq;
     g_Stats.posts++;
     x = find_post(f->addr);
     if (!x) {
-        g_Stats.unmatchedPosts++;
+        emit(EV_POST_UNMATCHED, f, f->len, &who, NULL);
     } else if ((f->flags & DMA_Continue) && f->addr != x->start) {
         /* Intermediate post for a later chunk; the transfer stays open */
     } else {
+        if ((f->flags ^ x->flags) & DMA_ReadFromRAM)
+            emit(EV_DIRECTION, f, f->len, &who, x);
+        /* The MMU library cut the transfer short and the caller never
+           continued it, yet it claims to have transferred more. */
+        if (x->covered < x->reqlen && f->len > x->covered)
+            emit(EV_SHORT_IGNORED, f, f->len, &who, x);
+        if (g_Strict) {
+            if (f->len != x->reqlen && f->len != x->covered)
+                emit(EV_LENGTH, f, f->len, &who, x);
+            if (f->addr != x->start)
+                emit(EV_INSIDE, f, f->len, &who, x);
+        }
         x->used = 0;
         g_Stats.active--;
     }
+    seq = g_EvSeq - seq;
     Enable();
+
+    if (seq)
+        wake_daemon();
 }
 
 /* ------------------------------------------------------------------ */
@@ -360,10 +484,69 @@ static BOOL remove_patches(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Formatting                                                         */
+/* ------------------------------------------------------------------ */
+
+extern UBYTE cc_StuffChar[];
+void cc_SerPutStr(const char *s);
+
+#define CC_LINELEN 320
+
+/* RawDoFmt() into buf. Every argument must be 32 bits wide (use %l..). */
+static void fmt(char *buf, const char *f, ...)
+{
+    va_list ap;
+
+    va_start(ap, f);
+    RawDoFmt((CONST_STRPTR)f, (APTR)ap, (VOID (*)())cc_StuffChar, buf);
+    va_end(ap);
+}
+
+static void flags_str(char *buf, ULONG flags)
+{
+    buf[0] = (flags & DMA_ReadFromRAM) ? 'R' : '-';
+    buf[1] = (flags & DMA_NoModify) ? 'N' : '-';
+    buf[2] = (flags & DMA_Continue) ? 'C' : '-';
+    buf[3] = '\0';
+}
+
+static void fmt_caller(char *buf, const struct Caller *c)
+{
+    fmt(buf, "$%08lx %s%s", (ULONG)c->pc,
+        (ULONG)(c->name[0] ? c->name : "?"), (ULONG)(c->inint ? " (int)" : ""));
+}
+
+static BOOL is_post_event(UBYTE type)
+{
+    return type == EV_POST_UNMATCHED || type == EV_DIRECTION ||
+           type == EV_SHORT_IGNORED || type == EV_LENGTH || type == EV_INSIDE;
+}
+
+static void fmt_event(char *buf, const struct Event *ev)
+{
+    char fl[4], who[64];
+
+    flags_str(fl, ev->flags);
+    fmt_caller(who, &ev->who);
+    fmt(buf, "CacheCop [%lus] %s\n  %s $%08lx len $%08lx fl %s by %s\n",
+        ev->t, (ULONG)kEventNames[ev->type],
+        (ULONG)(is_post_event(ev->type) ? "post" : "pre "),
+        (ULONG)ev->addr, ev->len, (ULONG)fl, (ULONG)who);
+    if (ev->hasXfer) {
+        const struct Xfer *x = &ev->xfer;
+        flags_str(fl, x->flags);
+        fmt_caller(who, &x->who);
+        fmt(buf + strlen(buf),
+            "  xfer $%08lx len $%08lx granted $%08lx fl %s by %s at %lus\n",
+            (ULONG)x->start, x->reqlen, x->covered, (ULONG)fl, (ULONG)who, x->t0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Control messages                                                   */
 /* ------------------------------------------------------------------ */
 
-#define CC_MAGIC 0x43437031UL   /* 'CCp1': bump when the layout changes */
+#define CC_MAGIC 0x43437032UL   /* 'CCp2': bump when the layout changes */
 
 enum {
     CC_CMD_STATUS = 1,
@@ -377,6 +560,9 @@ struct CCStatus {
     struct Stats stats;
     ULONG        nxfers;
     struct Xfer  xfers[CC_MAX_XFERS];
+    ULONG        evseq;    /* events emitted since start */
+    ULONG        nevents;  /* most recent events since RESET, oldest first */
+    struct Event events[CC_MAX_EVENTS];
 };
 
 struct CCMsg {
@@ -393,14 +579,18 @@ struct CCMsg {
 
 static struct MsgPort *g_Port = NULL;
 static BOOL g_StopRequested = FALSE;
+static BOOL g_Serial;
+static ULONG g_EvPrinted;      /* next event to print */
+static ULONG g_EvResetSeq;     /* first event after the last RESET */
 
 static void snapshot(struct CCStatus *st)
 {
-    ULONG i;
+    ULONG i, first;
 
     Disable();
     st->now = g_Now;
     st->stats = g_Stats;
+    st->evseq = g_EvSeq;
     Enable();
 
     /* One entry at a time, to keep interrupts-off windows short */
@@ -409,6 +599,18 @@ static void snapshot(struct CCStatus *st)
         Disable();
         if (g_Xfers[i].used)
             st->xfers[st->nxfers++] = g_Xfers[i];
+        Enable();
+    }
+
+    first = st->evseq > CC_MAX_EVENTS ? st->evseq - CC_MAX_EVENTS : 0;
+    if (first < g_EvResetSeq)
+        first = g_EvResetSeq;
+    st->nevents = 0;
+    for (i = first; i < st->evseq; i++) {
+        Disable();
+        /* Skip entries overwritten since we took evseq */
+        if (g_EvSeq - i <= CC_MAX_EVENTS)
+            st->events[st->nevents++] = g_Events[i % CC_MAX_EVENTS];
         Enable();
     }
 }
@@ -424,7 +626,46 @@ static void reset_stats(void)
         if (g_Xfers[i].used)
             g_Stats.active++;
     g_Stats.maxActive = g_Stats.active;
+    g_EvResetSeq = g_EvSeq;
     Enable();
+}
+
+static void out_line(const char *buf)
+{
+    PutStr((CONST_STRPTR)buf);
+    if (g_Serial)
+        cc_SerPutStr(buf);
+}
+
+/* Print events emitted since the last call */
+static void drain_events(void)
+{
+    char buf[CC_LINELEN];
+    struct Event ev;
+    ULONG lost;
+
+    for (;;) {
+        Disable();
+        lost = 0;
+        if (g_EvSeq - g_EvPrinted > CC_MAX_EVENTS) {
+            lost = g_EvSeq - g_EvPrinted - CC_MAX_EVENTS;
+            g_EvPrinted = g_EvSeq - CC_MAX_EVENTS;
+        }
+        if (g_EvPrinted == g_EvSeq) {
+            Enable();
+            break;
+        }
+        ev = g_Events[g_EvPrinted % CC_MAX_EVENTS];
+        g_EvPrinted++;
+        Enable();
+
+        if (lost) {
+            fmt(buf, "CacheCop: %lu event(s) lost\n", lost);
+            out_line(buf);
+        }
+        fmt_event(buf, &ev);
+        out_line(buf);
+    }
 }
 
 static VOID handle_cmd(struct CCMsg *m)
@@ -510,12 +751,14 @@ static VOID loop_until_stop(struct Timer *timer)
 
     g_StopRequested = FALSE;
     while (!g_StopRequested) {
-        ULONG sigs = Wait(portsig | timersig | SIGBREAKF_CTRL_C);
+        ULONG sigs = Wait(portsig | timersig | g_EvSigMask | SIGBREAKF_CTRL_C);
 
         if (sigs & SIGBREAKF_CTRL_C)
             g_StopRequested = TRUE;
         if ((sigs & timersig) && timer_tick(timer))
             g_Now++;
+        if (sigs & g_EvSigMask)
+            drain_events();
         if (sigs & portsig) {
             struct CCMsg *m;
             while ((m = (struct CCMsg *)GetMsg(g_Port)) != NULL) {
@@ -530,6 +773,7 @@ static LONG run_daemon(void)
 {
     struct Timer timer;
     LONG rc = RETURN_FAIL;
+    BYTE evsig = -1;
 
     memset(&timer, 0, sizeof(timer));
     if (FindPort((CONST_STRPTR)kPortName)) {
@@ -540,6 +784,14 @@ static LONG run_daemon(void)
         Printf((CONST_STRPTR)"CacheCop: cannot open %s.\n", (ULONG)TIMERNAME);
         goto out;
     }
+    evsig = AllocSignal(-1);
+    if (evsig < 0) {
+        Printf((CONST_STRPTR)"CacheCop: no free signal.\n");
+        goto out;
+    }
+    g_EvSigMask = 1UL << evsig;
+    g_DaemonTask = FindTask(NULL);
+
     g_Port = CreateMsgPort();
     if (!g_Port) {
         Printf((CONST_STRPTR)"CacheCop: cannot create port.\n");
@@ -556,7 +808,12 @@ static LONG run_daemon(void)
     }
     timer_start(&timer);
 
-    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started. Ctrl-C or 'cachecop stop' to quit.\n");
+    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started%s%s. "
+           "Ctrl-C or 'cachecop stop' to quit.\n",
+           (ULONG)(g_Serial ? ", logging to serial" : ""),
+           (ULONG)(g_Strict ? ", strict checks" : ""));
+    if (g_Serial)
+        cc_SerPutStr("CacheCop " CC_VERSION ": started\n");
     for (;;) {
         loop_until_stop(&timer);
         if (remove_patches())
@@ -564,10 +821,12 @@ static LONG run_daemon(void)
         Printf((CONST_STRPTR)"CacheCop: another program has patched CachePreDMA/"
                "CachePostDMA after us; remove it first, then stop again.\n");
     }
+    drain_events();
     Printf((CONST_STRPTR)"CacheCop: stopped.\n");
     rc = RETURN_OK;
 
 out:
+    g_DaemonTask = NULL;
     if (g_Port) {
         struct Message *m;
         RemPort(g_Port);
@@ -576,6 +835,8 @@ out:
         DeleteMsgPort(g_Port);
         g_Port = NULL;
     }
+    if (evsig >= 0)
+        FreeSignal(evsig);
     timer_close(&timer);
     return rc;
 }
@@ -628,61 +889,99 @@ static LONG send_cmd(ULONG cmd, struct CCStatus *status)
     return msg.result;
 }
 
-static void flags_str(char *buf, ULONG flags)
+static struct CCStatus *get_status(LONG *rc)
 {
-    buf[0] = (flags & DMA_ReadFromRAM) ? 'R' : '-';
-    buf[1] = (flags & DMA_NoModify) ? 'N' : '-';
-    buf[2] = '\0';
+    struct CCStatus *st = AllocVec(sizeof(*st), MEMF_PUBLIC | MEMF_CLEAR);
+
+    if (!st) {
+        Printf((CONST_STRPTR)"CacheCop: out of memory.\n");
+        *rc = RETURN_FAIL;
+        return NULL;
+    }
+    *rc = send_cmd(CC_CMD_STATUS, st);
+    if (*rc != RETURN_OK) {
+        FreeVec(st);
+        return NULL;
+    }
+    return st;
 }
 
-static void print_caller(const struct Caller *c)
+static ULONG count_violations(const struct Stats *s)
 {
-    Printf((CONST_STRPTR)"$%08lx  %s%s", (ULONG)c->pc,
-           (ULONG)(c->name[0] ? c->name : "?"), (ULONG)(c->inint ? " (int)" : ""));
+    ULONG i, n = 0;
+
+    for (i = 1; i < EV_COUNT; i++)
+        n += s->events[i];
+    return n;
 }
 
+/* RETURN_WARN if any violation was seen, so scripts can test for it */
 static LONG print_status(void)
 {
+    char buf[CC_LINELEN], who[64], fl[4];
     struct CCStatus *st;
     const struct Stats *s;
     LONG rc;
     ULONG i;
 
-    st = AllocVec(sizeof(*st), MEMF_PUBLIC | MEMF_CLEAR);
-    if (!st) {
-        Printf((CONST_STRPTR)"CacheCop: out of memory.\n");
-        return RETURN_FAIL;
-    }
-    rc = send_cmd(CC_CMD_STATUS, st);
-    if (rc != RETURN_OK)
-        goto out;
+    st = get_status(&rc);
+    if (!st)
+        return rc;
 
     s = &st->stats;
     Printf((CONST_STRPTR)"CacheCop status after %lus:\n", st->now);
     Printf((CONST_STRPTR)"  outstanding: %ld (max %lu)\n", s->active, s->maxActive);
     Printf((CONST_STRPTR)"  starts: %lu  continues: %lu  posts: %lu\n",
            s->starts, s->continues, s->posts);
-    Printf((CONST_STRPTR)"  unmatched posts: %lu  unmatched continues: %lu\n",
-           s->unmatchedPosts, s->unmatchedConts);
     if (s->untracked)
         Printf((CONST_STRPTR)"  untracked starts (table full): %lu\n", s->untracked);
 
+    if (count_violations(s)) {
+        Printf((CONST_STRPTR)"\nViolations ('cachecop events' for details):\n");
+        for (i = 1; i < EV_COUNT; i++)
+            if (s->events[i])
+                Printf((CONST_STRPTR)"  %6lu  %s\n", s->events[i], (ULONG)kEventNames[i]);
+        rc = RETURN_WARN;
+    } else {
+        Printf((CONST_STRPTR)"  no violations\n");
+    }
+
     if (st->nxfers) {
         Printf((CONST_STRPTR)"\nOutstanding transfers (R = from RAM, N = no modify):\n");
-        Printf((CONST_STRPTR)"     age  address    requested  granted    chunks fl  caller\n");
+        Printf((CONST_STRPTR)"     age  address    requested  granted    chunks fl   caller\n");
         for (i = 0; i < st->nxfers; i++) {
             const struct Xfer *x = &st->xfers[i];
-            char fl[3];
 
             flags_str(fl, x->flags);
-            Printf((CONST_STRPTR)"  %5lus  $%08lx  $%08lx  $%08lx  %5lu  %s  ",
-                   st->now - x->t0, (ULONG)x->start, x->reqlen, x->covered,
-                   (ULONG)x->chunks, (ULONG)fl);
-            print_caller(&x->who);
-            Printf((CONST_STRPTR)"\n");
+            fmt_caller(who, &x->who);
+            fmt(buf, "  %5lus  $%08lx  $%08lx  $%08lx  %5lu  %s  %s\n",
+                st->now - x->t0, (ULONG)x->start, x->reqlen, x->covered,
+                (ULONG)x->chunks, (ULONG)fl, (ULONG)who);
+            PutStr((CONST_STRPTR)buf);
         }
     }
-out:
+    FreeVec(st);
+    return rc;
+}
+
+static LONG print_events(void)
+{
+    char buf[CC_LINELEN];
+    struct CCStatus *st;
+    LONG rc;
+    ULONG i;
+
+    st = get_status(&rc);
+    if (!st)
+        return rc;
+    for (i = 0; i < st->nevents; i++) {
+        fmt_event(buf, &st->events[i]);
+        PutStr((CONST_STRPTR)buf);
+    }
+    Printf((CONST_STRPTR)"%lu violation(s) since reset; the last %lu are kept.\n",
+           count_violations(&st->stats), (ULONG)CC_MAX_EVENTS);
+    if (st->nevents)
+        rc = RETURN_WARN;
     FreeVec(st);
     return rc;
 }
@@ -691,17 +990,22 @@ out:
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
-#define TEMPLATE "COMMAND/A"
-enum { ARG_COMMAND, ARG_COUNT };
+#define TEMPLATE "COMMAND/A,SERIAL/S,STRICT/S"
+enum { ARG_COMMAND, ARG_SERIAL, ARG_STRICT, ARG_COUNT };
 
 static VOID usage(void)
 {
     Printf((CONST_STRPTR)
-        "Usage: cachecop START|STATUS|RESET|STOP\n"
-        "  START   install the patches and run until STOP or Ctrl-C\n"
-        "  STATUS  show counters and outstanding transfers\n"
-        "  RESET   clear the counters\n"
-        "  STOP    remove the patches and quit\n");
+        "Usage: cachecop " TEMPLATE "\n"
+        "  START   install the patches and run until STOP or Ctrl-C;\n"
+        "          violations are printed as they happen\n"
+        "    SERIAL  also log violations to the serial port (RawPutChar)\n"
+        "    STRICT  also flag posts whose address or length differs from the pre\n"
+        "  STATUS  show counters, violations and outstanding transfers\n"
+        "  EVENTS  show the most recent violations in detail\n"
+        "  RESET   clear the counters and the violation log\n"
+        "  STOP    remove the patches and quit\n"
+        "STATUS and EVENTS return WARN if a violation was seen.\n");
 }
 
 int main(void)
@@ -718,11 +1022,15 @@ int main(void)
         return RETURN_FAIL;
     }
     cmd = (const char *)args[ARG_COMMAND];
+    g_Serial = args[ARG_SERIAL] != 0;
+    g_Strict = args[ARG_STRICT] != 0;
 
     if (!stricmp(cmd, "start"))
         rc = run_daemon();
     else if (!stricmp(cmd, "status"))
         rc = print_status();
+    else if (!stricmp(cmd, "events"))
+        rc = print_events();
     else if (!stricmp(cmd, "reset"))
         rc = send_cmd(CC_CMD_RESET, NULL);
     else if (!stricmp(cmd, "stop"))
