@@ -25,8 +25,14 @@
         .text
         .even
 
+| g_InFlight counts callers currently executing stub code (including the
+| original CachePreDMA() called from _cc_PreStub, which returns into it).
+| addq/subq on memory are single instructions, so they are atomic with
+| respect to interrupts on a single 68k CPU.
+
         .globl  _cc_PreStub
 _cc_PreStub:
+        addq.l  #1,_g_InFlight
         move.l  a1,d1                   | d1 is scratch for CachePreDMA
         beq.s   .Lpre_nolen
         move.l  (a1),d1
@@ -44,10 +50,12 @@ _cc_PreStub:
         addq.l  #8,sp
         move.l  (sp)+,d0
         lea     16(sp),sp               | drop frame, leaving caller's PC
+        subq.l  #1,_g_InFlight
         rts
 
         .globl  _cc_PostStub
 _cc_PostStub:
+        addq.l  #1,_g_InFlight
         move.l  a1,d1
         beq.s   .Lpost_nolen
         move.l  (a1),d1
@@ -60,4 +68,5 @@ _cc_PostStub:
         movem.l (sp)+,d0/a0-a1          | restore original arguments
         addq.l  #4,sp                   | drop frame.len
         move.l  _g_OldPost,-(sp)
+        subq.l  #1,_g_InFlight          | the original returns to our caller
         rts                             | tail-jump to original

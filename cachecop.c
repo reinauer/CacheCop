@@ -52,6 +52,9 @@ static ULONG g_postsWithoutStart = 0;
 APTR g_OldPre = NULL;
 APTR g_OldPost = NULL;
 
+/* Number of callers currently inside the stubs (maintained by stubs.s) */
+volatile LONG g_InFlight = 0;
+
 /* Control port */
 static struct MsgPort *g_Port = NULL;
 static BOOL g_StopRequested = FALSE;
@@ -128,8 +131,31 @@ static BOOL install_patches(void)
     return TRUE;
 }
 
-static VOID remove_patches(void)
+/* Current target of a library vector (JMP abs.l), or NULL if it isn't one */
+static APTR current_vector(LONG lvo)
 {
+    UBYTE *v = (UBYTE *)SysBase + lvo;
+    if (*(UWORD *)v != 0x4EF9)
+        return NULL;
+    return *(APTR *)(v + 2);
+}
+
+/*
+ * Restore the original vectors. Refuses (and changes nothing) if someone
+ * else has SetFunction()ed either vector after us: restoring blindly would
+ * drop their patch, and anything chained to us would jump into our freed
+ * segment once we exit.
+ */
+static BOOL remove_patches(void)
+{
+    LONG waited;
+
+    Forbid();
+    if ((g_OldPre && current_vector(LVOCachePreDMA) != (APTR)cc_PreStub) ||
+        (g_OldPost && current_vector(LVOCachePostDMA) != (APTR)cc_PostStub)) {
+        Permit();
+        return FALSE;
+    }
     if (g_OldPre) {
         SetFunction((struct Library *)SysBase, LVOCachePreDMA, g_OldPre);
         g_OldPre = NULL;
@@ -138,6 +164,22 @@ static VOID remove_patches(void)
         SetFunction((struct Library *)SysBase, LVOCachePostDMA, g_OldPost);
         g_OldPost = NULL;
     }
+    Permit();
+
+    /*
+     * A task may have been preempted inside a stub (or inside the original
+     * CachePreDMA(), which returns into our stub). Wait until nobody is in
+     * there before our segment can be unloaded, plus a grace period for the
+     * few instructions after the in-flight counter is decremented.
+     */
+    for (waited = 0; g_InFlight > 0; waited++) {
+        if (waited == 5 * TICKS_PER_SECOND)
+            Printf((CONST_STRPTR)"CacheCop: waiting for %ld caller(s) to leave the patch...\n",
+                   (LONG)g_InFlight);
+        Delay(1);
+    }
+    Delay(TICKS_PER_SECOND / 5);
+    return TRUE;
 }
 
 /* Control messaging */
@@ -298,12 +340,18 @@ int main(int argc, char **argv)
         AddPort(g_Port);
 
         Printf((CONST_STRPTR)"CacheCop: started. Ctrl-C or 'cachecop stop' to quit.\n");
-        loop_until_stop();
+        for (;;) {
+            loop_until_stop();
+            if (remove_patches())
+                break;
+            Printf((CONST_STRPTR)"CacheCop: another program has patched CachePreDMA/"
+                   "CachePostDMA after us; remove it first, then stop again.\n");
+            g_StopRequested = FALSE;
+        }
 
         RemPort(g_Port);
         DeleteMsgPort(g_Port);
         g_Port = NULL;
-        remove_patches();
         Printf((CONST_STRPTR)"CacheCop: stopped.\n");
         return RETURN_OK;
     }
