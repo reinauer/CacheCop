@@ -54,6 +54,7 @@ APTR g_OldPost = NULL;
 
 /* Control port */
 static struct MsgPort *g_Port = NULL;
+static BOOL g_StopRequested = FALSE;
 
 /* Utility: atomic-ish inc/dec under Forbid/Permit to avoid task switching races */
 static inline void cc_inc_active(void)
@@ -172,11 +173,7 @@ static VOID handle_cmd(struct CCMsg *m)
             Permit();
             break;
         case CC_CMD_STOP:
-            /* Signal main loop to stop by setting port to NULL; main watches this */
-            if (g_Port) {
-                /* Tag the port userdata (mp_Flags) */
-                g_Port->mp_Flags = 1;
-            }
+            g_StopRequested = TRUE;
             break;
     }
 }
@@ -197,7 +194,7 @@ static VOID loop_until_stop(void)
                 ReplyMsg(&m->msg);
             }
         }
-        if (g_Port && g_Port->mp_Flags == 1) {
+        if (g_StopRequested) {
             running = FALSE;
         }
     }
@@ -293,7 +290,6 @@ int main(int argc, char **argv)
         }
         g_Port->mp_Node.ln_Name = (char *)kPortName;
         g_Port->mp_Node.ln_Pri = 0;
-        g_Port->mp_Flags = 0;
         AddPort(g_Port);
 
         Printf((CONST_STRPTR)"CacheCop: started. Ctrl-C or 'cachecop stop' to quit.\n");
