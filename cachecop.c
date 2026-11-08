@@ -64,7 +64,7 @@ struct Caller {
 /* One DMA transfer, from its first CachePreDMA() to its CachePostDMA() */
 struct Xfer {
     UBYTE  used;
-    UBYTE  pad;
+    UBYTE  stale;          /* already reported as outstanding too long */
     UWORD  chunks;         /* CachePreDMA() calls, including the first */
     APTR   start;          /* vaddress of the first call */
     ULONG  reqlen;         /* length requested by the first call */
@@ -85,6 +85,7 @@ enum {
     EV_LENGTH,             /* STRICT: post length differs from pre */
     EV_INSIDE,             /* STRICT: post address isn't the start */
     EV_TABLE_FULL,         /* transfer table overflowed */
+    EV_STALE,              /* outstanding longer than TIMEOUT seconds */
     EV_COUNT
 };
 
@@ -98,6 +99,7 @@ static const char *const kEventNames[EV_COUNT] = {
     "post length differs from pre",
     "post address is not the transfer start",
     "transfer table full, later starts untracked",
+    "transfer outstanding longer than TIMEOUT",
 };
 
 struct Event {
@@ -137,6 +139,7 @@ static ULONG g_EvSigMask;
 
 /* Options */
 static BOOL g_Strict;
+static ULONG g_Timeout = 30;   /* seconds; 0 = don't watch */
 
 /* Seconds since "cachecop start", advanced by the daemon's timer */
 static volatile ULONG g_Now;
@@ -303,16 +306,16 @@ static struct Xfer *find_overlap(APTR addr, ULONG len)
 }
 
 /* Record an event; call under Disable(). The daemon is signalled later. */
-static void emit(UBYTE type, const struct DMAFrame *f, ULONG len,
+static void emit(UBYTE type, APTR addr, ULONG len, ULONG flags,
                  const struct Caller *who, const struct Xfer *x)
 {
     struct Event *ev = &g_Events[g_EvSeq % CC_MAX_EVENTS];
 
     ev->type = type;
     ev->t = g_Now;
-    ev->addr = f->addr;
+    ev->addr = addr;
     ev->len = len;
-    ev->flags = f->flags;
+    ev->flags = flags;
     ev->who = *who;
     ev->hasXfer = x != NULL;
     if (x)
@@ -343,10 +346,11 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
         g_Stats.starts++;
         x = find_overlap(f->addr, f->len);
         if (x)
-            emit(EV_OVERLAP, f, f->len, &who, x);
+            emit(EV_OVERLAP, f->addr, f->len, f->flags, &who, x);
         x = alloc_xfer();
         if (x) {
             x->used = 1;
+            x->stale = 0;
             x->chunks = 1;
             x->start = f->addr;
             x->reqlen = f->len;
@@ -360,7 +364,7 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
         } else {
             /* Report the first overflow only, not every start after it */
             if (g_Stats.untracked++ == 0)
-                emit(EV_TABLE_FULL, f, f->len, &who, NULL);
+                emit(EV_TABLE_FULL, f->addr, f->len, f->flags, &who, NULL);
         }
     } else {
         g_Stats.continues++;
@@ -370,7 +374,7 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
             if ((UBYTE *)f->addr == (UBYTE *)x->start + x->covered)
                 x->covered += granted;
         } else {
-            emit(EV_CONT_UNMATCHED, f, f->len, &who, NULL);
+            emit(EV_CONT_UNMATCHED, f->addr, f->len, f->flags, &who, NULL);
         }
     }
     seq = g_EvSeq - seq;
@@ -393,21 +397,21 @@ void cc_post_hook(struct DMAFrame *f)
     g_Stats.posts++;
     x = find_post(f->addr);
     if (!x) {
-        emit(EV_POST_UNMATCHED, f, f->len, &who, NULL);
+        emit(EV_POST_UNMATCHED, f->addr, f->len, f->flags, &who, NULL);
     } else if ((f->flags & DMA_Continue) && f->addr != x->start) {
         /* Intermediate post for a later chunk; the transfer stays open */
     } else {
         if ((f->flags ^ x->flags) & DMA_ReadFromRAM)
-            emit(EV_DIRECTION, f, f->len, &who, x);
+            emit(EV_DIRECTION, f->addr, f->len, f->flags, &who, x);
         /* The MMU library cut the transfer short and the caller never
            continued it, yet it claims to have transferred more. */
         if (x->covered < x->reqlen && f->len > x->covered)
-            emit(EV_SHORT_IGNORED, f, f->len, &who, x);
+            emit(EV_SHORT_IGNORED, f->addr, f->len, f->flags, &who, x);
         if (g_Strict) {
             if (f->len != x->reqlen && f->len != x->covered)
-                emit(EV_LENGTH, f, f->len, &who, x);
+                emit(EV_LENGTH, f->addr, f->len, f->flags, &who, x);
             if (f->addr != x->start)
-                emit(EV_INSIDE, f, f->len, &who, x);
+                emit(EV_INSIDE, f->addr, f->len, f->flags, &who, x);
         }
         x->used = 0;
         g_Stats.active--;
@@ -483,6 +487,32 @@ static BOOL remove_patches(void)
     return TRUE;
 }
 
+/*
+ * Called by the daemon once a second: report transfers that have been
+ * outstanding for TIMEOUT seconds, once each. A real DMA finishes in
+ * milliseconds; one that never gets its CachePostDMA() stays here forever.
+ */
+static BOOL check_stale(void)
+{
+    BOOL found = FALSE;
+    ULONG i;
+
+    if (!g_Timeout)
+        return FALSE;
+    for (i = 0; i < CC_MAX_XFERS; i++) {
+        struct Xfer *x = &g_Xfers[i];
+
+        Disable();
+        if (x->used && !x->stale && g_Now - x->t0 >= g_Timeout) {
+            x->stale = 1;
+            emit(EV_STALE, x->start, x->reqlen, x->flags, &x->who, x);
+            found = TRUE;
+        }
+        Enable();
+    }
+    return found;
+}
+
 /* ------------------------------------------------------------------ */
 /* Formatting                                                         */
 /* ------------------------------------------------------------------ */
@@ -526,12 +556,18 @@ static void fmt_event(char *buf, const struct Event *ev)
 {
     char fl[4], who[64];
 
-    flags_str(fl, ev->flags);
-    fmt_caller(who, &ev->who);
-    fmt(buf, "CacheCop [%lus] %s\n  %s $%08lx len $%08lx fl %s by %s\n",
-        ev->t, (ULONG)kEventNames[ev->type],
-        (ULONG)(is_post_event(ev->type) ? "post" : "pre "),
-        (ULONG)ev->addr, ev->len, (ULONG)fl, (ULONG)who);
+    if (ev->type == EV_STALE) {
+        /* No offending call, just the transfer */
+        fmt(buf, "CacheCop [%lus] %s (%lus)\n", ev->t,
+            (ULONG)kEventNames[ev->type], ev->t - ev->xfer.t0);
+    } else {
+        flags_str(fl, ev->flags);
+        fmt_caller(who, &ev->who);
+        fmt(buf, "CacheCop [%lus] %s\n  %s $%08lx len $%08lx fl %s by %s\n",
+            ev->t, (ULONG)kEventNames[ev->type],
+            (ULONG)(is_post_event(ev->type) ? "post" : "pre "),
+            (ULONG)ev->addr, ev->len, (ULONG)fl, (ULONG)who);
+    }
     if (ev->hasXfer) {
         const struct Xfer *x = &ev->xfer;
         flags_str(fl, x->flags);
@@ -546,7 +582,7 @@ static void fmt_event(char *buf, const struct Event *ev)
 /* Control messages                                                   */
 /* ------------------------------------------------------------------ */
 
-#define CC_MAGIC 0x43437032UL   /* 'CCp2': bump when the layout changes */
+#define CC_MAGIC 0x43437033UL   /* 'CCp3': bump when the layout changes */
 
 enum {
     CC_CMD_STATUS = 1,
@@ -755,8 +791,11 @@ static VOID loop_until_stop(struct Timer *timer)
 
         if (sigs & SIGBREAKF_CTRL_C)
             g_StopRequested = TRUE;
-        if ((sigs & timersig) && timer_tick(timer))
+        if ((sigs & timersig) && timer_tick(timer)) {
             g_Now++;
+            if (check_stale())
+                drain_events();
+        }
         if (sigs & g_EvSigMask)
             drain_events();
         if (sigs & portsig) {
@@ -808,10 +847,10 @@ static LONG run_daemon(void)
     }
     timer_start(&timer);
 
-    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started%s%s. "
+    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started%s%s, timeout %lus. "
            "Ctrl-C or 'cachecop stop' to quit.\n",
            (ULONG)(g_Serial ? ", logging to serial" : ""),
-           (ULONG)(g_Strict ? ", strict checks" : ""));
+           (ULONG)(g_Strict ? ", strict checks" : ""), g_Timeout);
     if (g_Serial)
         cc_SerPutStr("CacheCop " CC_VERSION ": started\n");
     for (;;) {
@@ -947,15 +986,17 @@ static LONG print_status(void)
     }
 
     if (st->nxfers) {
-        Printf((CONST_STRPTR)"\nOutstanding transfers (R = from RAM, N = no modify):\n");
+        Printf((CONST_STRPTR)"\nOutstanding transfers (R = from RAM, N = no modify,"
+               " ! = over TIMEOUT):\n");
         Printf((CONST_STRPTR)"     age  address    requested  granted    chunks fl   caller\n");
         for (i = 0; i < st->nxfers; i++) {
             const struct Xfer *x = &st->xfers[i];
 
             flags_str(fl, x->flags);
             fmt_caller(who, &x->who);
-            fmt(buf, "  %5lus  $%08lx  $%08lx  $%08lx  %5lu  %s  %s\n",
-                st->now - x->t0, (ULONG)x->start, x->reqlen, x->covered,
+            fmt(buf, "  %5lus%s $%08lx  $%08lx  $%08lx  %5lu  %s  %s\n",
+                st->now - x->t0, (ULONG)(x->stale ? "!" : " "),
+                (ULONG)x->start, x->reqlen, x->covered,
                 (ULONG)x->chunks, (ULONG)fl, (ULONG)who);
             PutStr((CONST_STRPTR)buf);
         }
@@ -990,8 +1031,8 @@ static LONG print_events(void)
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
-#define TEMPLATE "COMMAND/A,SERIAL/S,STRICT/S"
-enum { ARG_COMMAND, ARG_SERIAL, ARG_STRICT, ARG_COUNT };
+#define TEMPLATE "COMMAND/A,SERIAL/S,STRICT/S,TIMEOUT/K/N"
+enum { ARG_COMMAND, ARG_SERIAL, ARG_STRICT, ARG_TIMEOUT, ARG_COUNT };
 
 static VOID usage(void)
 {
@@ -1001,6 +1042,7 @@ static VOID usage(void)
         "          violations are printed as they happen\n"
         "    SERIAL  also log violations to the serial port (RawPutChar)\n"
         "    STRICT  also flag posts whose address or length differs from the pre\n"
+        "    TIMEOUT=n  flag transfers outstanding for n seconds (default 30, 0 = off)\n"
         "  STATUS  show counters, violations and outstanding transfers\n"
         "  EVENTS  show the most recent violations in detail\n"
         "  RESET   clear the counters and the violation log\n"
@@ -1024,6 +1066,8 @@ int main(void)
     cmd = (const char *)args[ARG_COMMAND];
     g_Serial = args[ARG_SERIAL] != 0;
     g_Strict = args[ARG_STRICT] != 0;
+    if (args[ARG_TIMEOUT])
+        g_Timeout = *(ULONG *)args[ARG_TIMEOUT];
 
     if (!stricmp(cmd, "start"))
         rc = run_daemon();
