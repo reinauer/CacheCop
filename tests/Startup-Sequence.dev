@@ -1,0 +1,10 @@
+; CacheCop development test floppy (make test-adf).
+; Like the release self-test, plus SegTracker (if it was downloaded) for
+; caller names, and reads through a real driver.
+If EXISTS SYS:SegTracker
+  SYS:SegTracker
+EndIf
+Run SYS:cachecop START TIMEOUT=5
+SYS:dmatest ALL WAIT
+SYS:dmatest DISK @TEST_DEVICE@ @TEST_UNIT@
+SYS:cachecop STATUS

@@ -84,9 +84,32 @@ $(DISK): $(BIN) tests/dmatest tests/Startup-Sequence cachecop.readme
 		+ boot install
 	@echo "Created $@"
 
-# Same floppy under a fixed name, for local emulator runs
-test-adf: $(DISK)
-	cp $(DISK) cachecop-test.adf
+# Development floppy for emulator runs: the self-test plus SegTracker and
+# reads through a real driver (TEST_DEVICE/TEST_UNIT). SegTracker comes
+# from Aminet's Enforcer archive, whose license allows redistributing only
+# the unmodified archive, so it never goes on the release floppy.
+TEST_DEVICE ?= a4091.device
+TEST_UNIT   ?= 0
+ENFORCER_LHA = build/downloads/enforcer.lha
+SEGTRACKER   = build/downloads/Enforcer/SegTracker
+
+$(ENFORCER_LHA):
+	mkdir -p $(dir $@)
+	curl -sfL -o $@ http://aminet.net/dev/debug/enforcer.lha
+
+$(SEGTRACKER): $(ENFORCER_LHA)
+	cd build/downloads && lha xq enforcer.lha Enforcer/SegTracker
+	touch $@
+
+test-adf: $(BIN) tests/dmatest tests/Startup-Sequence.dev $(SEGTRACKER)
+	sed -e 's/@TEST_DEVICE@/$(TEST_DEVICE)/' -e 's/@TEST_UNIT@/$(TEST_UNIT)/' \
+		tests/Startup-Sequence.dev > build/Startup-Sequence.dev
+	rm -f cachecop-test.adf
+	xdftool cachecop-test.adf create + format CacheCop-test \
+		+ write $(BIN) + write tests/dmatest + write $(SEGTRACKER) SegTracker \
+		+ makedir S + write build/Startup-Sequence.dev S/Startup-Sequence \
+		+ boot install
+	@echo "Created cachecop-test.adf"
 
 clean:
 	rm -rf build $(BIN) tests/dmatest cachecop-*.adf cachecop-*.lha

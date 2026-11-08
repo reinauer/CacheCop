@@ -1,5 +1,5 @@
-; CacheCop test floppy: boots, runs the test cases, shows the results.
+; CacheCop self-test: starts CacheCop, runs the test cases, shows results.
 ; Uses only Shell built-ins, so it works without a C: directory.
 Run SYS:cachecop START TIMEOUT=5
-SYS:dmatest ALL
+SYS:dmatest ALL WAIT
 SYS:cachecop STATUS

@@ -2,8 +2,15 @@
  * dmatest — exercise CacheCop with correct and broken CachePreDMA()/
  * CachePostDMA() sequences.
  *
- *   dmatest ALL | OK | CHUNKS | LEAK | NOPRE | NOCONT | DIR | SHORT |
- *           LENGTH | INSIDE | POSTCONT | OVERLAP | INT | STRESS
+ *   dmatest <test> [WAIT]
+ *       test: ALL | OK | CHUNKS | LEAK | NOPRE | NOCONT | DIR | SHORT |
+ *             LENGTH | INSIDE | POSTCONT | OVERLAP | INT | STRESS
+ *       WAIT: wait up to 10s for CacheCop to start (for "Run cachecop")
+ *
+ *   dmatest DISK <device> [unit]
+ *       read from a real block device (never writes), at every buffer
+ *       alignment, so its driver's CachePreDMA()/CachePostDMA() calls
+ *       can be checked
  *
  * Each case prints what it does; compare with "cachecop status" and
  * "cachecop events". Leaked transfers point into a buffer that is never
@@ -15,6 +22,8 @@
 #include <exec/interrupts.h>
 #include <exec/memory.h>
 #include <hardware/intbits.h>
+#include <exec/io.h>
+#include <devices/trackdisk.h>
 #include <dos/dos.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -172,15 +181,79 @@ static const struct {
     { "OVERLAP", t_overlap }, { "INT", t_int }, { "STRESS", t_stress },
 };
 
+/* Read from a real device at all four buffer alignments */
+static int disk_test(const char *devname, ULONG unit)
+{
+    struct MsgPort *port;
+    struct IOStdReq *io;
+    UBYTE *dbuf;
+    ULONG i, ok = 0, failed = 0;
+
+    Printf("DISK: reading from %s unit %lu\n", (ULONG)devname, unit);
+    port = CreateMsgPort();
+    io = port ? (struct IOStdReq *)CreateIORequest(port, sizeof(*io)) : NULL;
+    dbuf = AllocMem(65536 + 16, MEMF_PUBLIC);
+    if (!io || !dbuf) {
+        Printf("DISK: out of memory\n");
+        goto out;
+    }
+    if (OpenDevice((CONST_STRPTR)devname, unit, (struct IORequest *)io, 0)) {
+        Printf("DISK: can't open %s unit %lu (error %ld)\n",
+               (ULONG)devname, unit, (LONG)io->io_Error);
+        goto out;
+    }
+    for (i = 0; i < 64; i++) {
+        io->io_Command = CMD_READ;
+        io->io_Data = dbuf + (i & 3);            /* 0..3 byte misalignment */
+        io->io_Length = 512 * (1 + (i % 32));    /* 512 bytes .. 16K */
+        io->io_Offset = 512 * i;
+        if (DoIO((struct IORequest *)io) == 0)
+            ok++;
+        else
+            failed++;
+    }
+    Printf("DISK: %lu reads ok, %lu failed\n", ok, failed);
+    CloseDevice((struct IORequest *)io);
+out:
+    if (dbuf)
+        FreeMem(dbuf, 65536 + 16);
+    if (io)
+        DeleteIORequest((struct IORequest *)io);
+    if (port)
+        DeleteMsgPort(port);
+    return failed ? RETURN_WARN : RETURN_OK;
+}
+
+static ULONG parse_ulong(const char *p)
+{
+    ULONG v = 0;
+    while (*p >= '0' && *p <= '9')
+        v = v * 10 + (*p++ - '0');
+    return v;
+}
+
 int main(int argc, char **argv)
 {
     ULONG i;
     BOOL all, ran = FALSE;
+    int rc;
 
     if (argc < 2) {
-        Printf("Usage: dmatest ALL|OK|CHUNKS|LEAK|NOPRE|NOCONT|DIR|SHORT|LENGTH|INSIDE|POSTCONT|OVERLAP|INT|STRESS\n");
+        Printf("Usage: dmatest <test> [WAIT] | DISK <device> [unit]\n"
+               "tests: ALL OK CHUNKS LEAK NOPRE NOCONT DIR SHORT LENGTH INSIDE\n"
+               "       POSTCONT OVERLAP INT STRESS\n");
         return RETURN_FAIL;
     }
+    if (!stricmp(argv[1], "DISK")) {
+        if (argc < 3) {
+            Printf("Usage: dmatest DISK <device> [unit]\n");
+            return RETURN_FAIL;
+        }
+        rc = disk_test(argv[2], argc > 3 ? parse_ulong(argv[3]) : 0);
+        Delay(TICKS_PER_SECOND);
+        return rc;
+    }
+
     /* Never freed: leaked transfers must keep pointing at valid memory */
     buf = AllocMem(0x30000, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf)
@@ -188,10 +261,11 @@ int main(int argc, char **argv)
     Printf("dmatest: buffer at $%08lx\n", (ULONG)buf);
 
     /* "Run cachecop START" may not have installed its patches yet */
-    for (i = 0; i < 10 * TICKS_PER_SECOND && !FindPort("CacheCop"); i++)
-        Delay(1);
-    if (i)
+    if (argc > 2 && !stricmp(argv[2], "WAIT")) {
+        for (i = 0; i < 10 * TICKS_PER_SECOND && !FindPort("CacheCop"); i++)
+            Delay(1);
         Delay(TICKS_PER_SECOND / 2);
+    }
 
     all = !stricmp(argv[1], "ALL");
     for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
