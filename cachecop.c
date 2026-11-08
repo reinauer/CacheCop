@@ -1242,8 +1242,44 @@ static ULONG count_violations(const struct Stats *s)
     return n;
 }
 
+/*
+ * Outstanding transfers grouped by caller PC: a leaking driver leaves many
+ * transfers from the same call site, and one line per site says it all.
+ */
+static void print_by_caller(const struct CCStatus *st)
+{
+    UBYTE done[CC_MAX_XFERS];
+    char buf[CC_LINELEN], who[128];
+    ULONG i, j;
+
+    memset(done, 0, sizeof(done));
+    Printf((CONST_STRPTR)"\nOutstanding transfers by caller ('cachecop status full'"
+           " lists them all):\n");
+    for (i = 0; i < st->nxfers; i++) {
+        const struct Xfer *x = &st->xfers[i];
+        ULONG count = 0, oldest = 0, stale = 0;
+
+        if (done[i])
+            continue;
+        for (j = i; j < st->nxfers; j++) {
+            const struct Xfer *y = &st->xfers[j];
+            if (done[j] || y->who.pc != x->who.pc)
+                continue;
+            done[j] = 1;
+            count++;
+            stale += y->stale;
+            if (st->now - y->t0 > oldest)
+                oldest = st->now - y->t0;
+        }
+        fmt_caller(who, &x->who);
+        fmt(buf, "  %5lu  oldest %lus, %lu timed out\n         by %s\n",
+            count, oldest, stale, (ULONG)who);
+        PutStr((CONST_STRPTR)buf);
+    }
+}
+
 /* RETURN_WARN if any violation was seen, so scripts can test for it */
-static LONG print_status(void)
+static LONG print_status(BOOL full)
 {
     char buf[CC_LINELEN], who[128], fl[4];
     struct CCStatus *st;
@@ -1273,7 +1309,9 @@ static LONG print_status(void)
         Printf((CONST_STRPTR)"  no violations\n");
     }
 
-    if (st->nxfers) {
+    if (st->nxfers && !full)
+        print_by_caller(st);
+    if (st->nxfers && full) {
         Printf((CONST_STRPTR)"\nOutstanding transfers (R=from RAM, N=no modify, !=timed out):\n");
         for (i = 0; i < st->nxfers; i++) {
             const struct Xfer *x = &st->xfers[i];
@@ -1318,8 +1356,54 @@ static LONG print_events(void)
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
-#define TEMPLATE "COMMAND/A,SERIAL/S,TIMEOUT/K/N"
-enum { ARG_COMMAND, ARG_SERIAL, ARG_TIMEOUT, ARG_COUNT };
+#define TEMPLATE "COMMAND/A,ARG,SERIAL/S,TIMEOUT/K/N"
+/* ARG: the address for WHERE, or FULL for STATUS */
+enum { ARG_COMMAND, ARG_ARG, ARG_SERIAL, ARG_TIMEOUT, ARG_COUNT };
+
+/* Parse $1234, 0x1234 or plain hex */
+static BOOL parse_hex(const char *p, ULONG *val)
+{
+    ULONG v = 0;
+
+    if (*p == '$')
+        p++;
+    else if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        p += 2;
+    if (!*p)
+        return FALSE;
+    for (; *p; p++) {
+        UBYTE c = *p;
+        if (c >= '0' && c <= '9')
+            c -= '0';
+        else if (c >= 'a' && c <= 'f')
+            c -= 'a' - 10;
+        else if (c >= 'A' && c <= 'F')
+            c -= 'A' - 10;
+        else
+            return FALSE;
+        v = (v << 4) | c;
+    }
+    *val = v;
+    return TRUE;
+}
+
+/* WHERE: name the code at an address, e.g. a PC from a serial log */
+static LONG print_where(const char *arg)
+{
+    char buf[CC_WHERELEN + 32];
+    ULONG addr;
+
+    if (!arg || !parse_hex(arg, &addr)) {
+        Printf((CONST_STRPTR)"CacheCop: WHERE needs a hex address, like $F81234.\n");
+        return RETURN_FAIL;
+    }
+    if (!where_is(buf, (APTR)addr)) {
+        Printf((CONST_STRPTR)"$%08lx: unknown\n", addr);
+        return RETURN_WARN;
+    }
+    Printf((CONST_STRPTR)"$%08lx: %s\n", addr, (ULONG)buf);
+    return RETURN_OK;
+}
 
 static VOID usage(void)
 {
@@ -1329,10 +1413,12 @@ static VOID usage(void)
         "          violations are printed as they happen\n"
         "    SERIAL  also log violations to the serial port (RawPutChar)\n"
         "    TIMEOUT=n  flag transfers outstanding for n seconds (default 30, 0 = off)\n"
-        "  STATUS  show counters, violations and outstanding transfers\n"
+        "  STATUS [FULL]  show counters, violations and outstanding transfers\n"
+        "          by caller; FULL lists every transfer\n"
         "  EVENTS  show the most recent violations in detail\n"
         "  RESET   clear the counters and the violation log\n"
         "  STOP    remove the patches and quit\n"
+        "  WHERE <address>  name the code at an address\n"
         "STATUS and EVENTS return WARN if a violation was seen.\n");
 }
 
@@ -1359,13 +1445,16 @@ int main(void)
     if (!stricmp(cmd, "start"))
         rc = run_daemon();
     else if (!stricmp(cmd, "status"))
-        rc = print_status();
+        rc = print_status(args[ARG_ARG] &&
+                          !stricmp((const char *)args[ARG_ARG], "full"));
     else if (!stricmp(cmd, "events"))
         rc = print_events();
     else if (!stricmp(cmd, "reset"))
         rc = send_cmd(CC_CMD_RESET, NULL);
     else if (!stricmp(cmd, "stop"))
         rc = send_cmd(CC_CMD_STOP, NULL);
+    else if (!stricmp(cmd, "where"))
+        rc = print_where((const char *)args[ARG_ARG]);
     else {
         usage();
         rc = RETURN_FAIL;
