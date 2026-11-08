@@ -79,7 +79,9 @@ struct Xfer {
     UWORD  chunks;         /* CachePreDMA() calls, including the first */
     APTR   start;          /* vaddress of the first call */
     ULONG  reqlen;         /* length requested by the first call */
-    ULONG  covered;        /* bytes granted so far, contiguous from start */
+    ULONG  covered;        /* bytes prepared so far, contiguous from start;
+                              exceeds reqlen when the driver splits the
+                              transfer itself and continues it */
     ULONG  flags;          /* flags of the first call */
     ULONG  t0;             /* g_Now when the transfer started */
     struct Caller who;     /* caller of the first call */
@@ -93,10 +95,11 @@ enum {
     EV_OVERLAP,            /* new transfer overlaps an outstanding one */
     EV_DIRECTION,          /* DMA_ReadFromRAM differs between pre and post */
     EV_SHORT_IGNORED,      /* shortened grant posted in full, no continue */
-    EV_LENGTH,             /* STRICT: post length differs from pre */
-    EV_INSIDE,             /* STRICT: post address isn't the start */
+    EV_LENGTH,             /* post length isn't the initial length */
+    EV_INSIDE,             /* post address isn't the initial address */
     EV_TABLE_FULL,         /* transfer table overflowed */
     EV_STALE,              /* outstanding longer than TIMEOUT seconds */
+    EV_POST_CONTINUE,      /* DMA_Continue passed to CachePostDMA() */
     EV_COUNT
 };
 
@@ -107,10 +110,11 @@ static const char *const kEventNames[EV_COUNT] = {
     "CachePreDMA() overlaps an outstanding transfer",
     "DMA_ReadFromRAM differs between pre and post",
     "posted past a shortened grant without DMA_Continue",
-    "post length differs from pre",
-    "post address is not the transfer start",
+    "post length is not the transfer's initial length",
+    "post address is not the transfer's initial address",
     "transfer table full, later starts untracked",
     "transfer outstanding longer than TIMEOUT",
+    "DMA_Continue passed to CachePostDMA()",
 };
 
 struct Event {
@@ -149,7 +153,6 @@ static struct Task *g_DaemonTask;
 static ULONG g_EvSigMask;
 
 /* Options */
-static BOOL g_Strict;
 static ULONG g_Timeout = 30;   /* seconds; 0 = don't watch */
 
 /* Seconds since "cachecop start", advanced by the daemon's timer */
@@ -236,6 +239,12 @@ static void capture_caller(struct Caller *c, APTR pc, APTR sp)
     copy_name(c->name, t->tc_Node.ln_Name, CC_NAMELEN);
 }
 
+/* Bytes the transfer spans: requested up front, or prepared in chunks */
+static ULONG extent(const struct Xfer *x)
+{
+    return x->covered > x->reqlen ? x->covered : x->reqlen;
+}
+
 static struct Xfer *alloc_xfer(void)
 {
     ULONG i;
@@ -270,7 +279,7 @@ static struct Xfer *find_continuation(APTR addr, struct Task *task)
     for (i = 0; i < CC_MAX_XFERS; i++) {
         x = &g_Xfers[i];
         if (x->used && (UBYTE *)addr >= (UBYTE *)x->start &&
-            (UBYTE *)addr < (UBYTE *)x->start + x->reqlen)
+            (UBYTE *)addr < (UBYTE *)x->start + extent(x))
             return x;
     }
     return NULL;
@@ -293,7 +302,7 @@ static struct Xfer *find_post(APTR addr)
         if (x->start == addr)
             return x;
         if (!inside && (UBYTE *)addr > (UBYTE *)x->start &&
-            (UBYTE *)addr < (UBYTE *)x->start + x->reqlen)
+            (UBYTE *)addr < (UBYTE *)x->start + extent(x))
             inside = x;
     }
     return inside;
@@ -310,7 +319,7 @@ static struct Xfer *find_overlap(APTR addr, ULONG len)
     for (i = 0; i < CC_MAX_XFERS; i++) {
         struct Xfer *x = &g_Xfers[i];
         UBYTE *s = x->start;
-        if (x->used && a < s + x->reqlen && s < e)
+        if (x->used && a < s + extent(x) && s < e)
             return x;
     }
     return NULL;
@@ -406,24 +415,31 @@ void cc_post_hook(struct DMAFrame *f)
     Disable();
     seq = g_EvSeq;
     g_Stats.posts++;
+    /*
+     * The MuLib Programmer's Manual (7.4): CachePostDMA() is called once
+     * per transfer, after it completed or was aborted, with the initial
+     * logical address and the complete initial length, and with
+     * DMA_ReadFromRAM as for CachePreDMA(). Only DMA_NoModify and
+     * DMA_ReadFromRAM are defined for it. So every post closes the transfer
+     * it matches; anything else about it is a violation.
+     */
+    if (f->flags & DMA_Continue)
+        emit(EV_POST_CONTINUE, f->addr, f->len, f->flags, &who, NULL);
     x = find_post(f->addr);
     if (!x) {
         emit(EV_POST_UNMATCHED, f->addr, f->len, f->flags, &who, NULL);
-    } else if ((f->flags & DMA_Continue) && f->addr != x->start) {
-        /* Intermediate post for a later chunk; the transfer stays open */
     } else {
+        if (f->addr != x->start)
+            emit(EV_INSIDE, f->addr, f->len, f->flags, &who, x);
+        /* The whole length: as requested, or as prepared in chunks */
+        if (f->len != x->reqlen && f->len != x->covered)
+            emit(EV_LENGTH, f->addr, f->len, f->flags, &who, x);
         if ((f->flags ^ x->flags) & DMA_ReadFromRAM)
             emit(EV_DIRECTION, f->addr, f->len, f->flags, &who, x);
         /* The MMU library cut the transfer short and the caller never
            continued it, yet it claims to have transferred more. */
         if (x->covered < x->reqlen && f->len > x->covered)
             emit(EV_SHORT_IGNORED, f->addr, f->len, f->flags, &who, x);
-        if (g_Strict) {
-            if (f->len != x->reqlen && f->len != x->covered)
-                emit(EV_LENGTH, f->addr, f->len, f->flags, &who, x);
-            if (f->addr != x->start)
-                emit(EV_INSIDE, f->addr, f->len, f->flags, &who, x);
-        }
         x->used = 0;
         g_Stats.active--;
     }
@@ -686,7 +702,8 @@ static void fmt_caller(char *buf, const struct Caller *c)
 static BOOL is_post_event(UBYTE type)
 {
     return type == EV_POST_UNMATCHED || type == EV_DIRECTION ||
-           type == EV_SHORT_IGNORED || type == EV_LENGTH || type == EV_INSIDE;
+           type == EV_SHORT_IGNORED || type == EV_LENGTH || type == EV_INSIDE ||
+           type == EV_POST_CONTINUE;
 }
 
 static void fmt_event(char *buf, const struct Event *ev)
@@ -710,7 +727,7 @@ static void fmt_event(char *buf, const struct Event *ev)
         flags_str(fl, x->flags);
         fmt_caller(who, &x->who);
         fmt(buf + strlen(buf),
-            "  xfer $%08lx len $%lx granted $%lx fl %s at %lus\n"
+            "  xfer $%08lx len $%lx prepared $%lx fl %s at %lus\n"
             "       by %s\n",
             (ULONG)x->start, x->reqlen, x->covered, (ULONG)fl, x->t0, (ULONG)who);
     }
@@ -985,10 +1002,9 @@ static LONG run_daemon(void)
     }
     timer_start(&timer);
 
-    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started%s%s, timeout %lus. "
+    Printf((CONST_STRPTR)"CacheCop " CC_VERSION ": started%s, timeout %lus. "
            "Ctrl-C or 'cachecop stop' to quit.\n",
-           (ULONG)(g_Serial ? ", logging to serial" : ""),
-           (ULONG)(g_Strict ? ", strict checks" : ""), g_Timeout);
+           (ULONG)(g_Serial ? ", logging to serial" : ""), g_Timeout);
     if (g_Serial)
         cc_SerPutStr("CacheCop " CC_VERSION ": started\n");
     for (;;) {
@@ -1130,7 +1146,7 @@ static LONG print_status(void)
 
             flags_str(fl, x->flags);
             fmt_caller(who, &x->who);
-            fmt(buf, "  %5lus%s $%08lx len $%lx granted $%lx chunks %lu fl %s\n"
+            fmt(buf, "  %5lus%s $%08lx len $%lx prepared $%lx chunks %lu fl %s\n"
                 "          by %s\n",
                 st->now - x->t0, (ULONG)(x->stale ? "!" : " "),
                 (ULONG)x->start, x->reqlen, x->covered,
@@ -1168,8 +1184,8 @@ static LONG print_events(void)
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 
-#define TEMPLATE "COMMAND/A,SERIAL/S,STRICT/S,TIMEOUT/K/N"
-enum { ARG_COMMAND, ARG_SERIAL, ARG_STRICT, ARG_TIMEOUT, ARG_COUNT };
+#define TEMPLATE "COMMAND/A,SERIAL/S,TIMEOUT/K/N"
+enum { ARG_COMMAND, ARG_SERIAL, ARG_TIMEOUT, ARG_COUNT };
 
 static VOID usage(void)
 {
@@ -1178,7 +1194,6 @@ static VOID usage(void)
         "  START   install the patches and run until STOP or Ctrl-C;\n"
         "          violations are printed as they happen\n"
         "    SERIAL  also log violations to the serial port (RawPutChar)\n"
-        "    STRICT  also flag posts whose address or length differs from the pre\n"
         "    TIMEOUT=n  flag transfers outstanding for n seconds (default 30, 0 = off)\n"
         "  STATUS  show counters, violations and outstanding transfers\n"
         "  EVENTS  show the most recent violations in detail\n"
@@ -1204,7 +1219,6 @@ int main(void)
     }
     cmd = (const char *)args[ARG_COMMAND];
     g_Serial = args[ARG_SERIAL] != 0;
-    g_Strict = args[ARG_STRICT] != 0;
     if (args[ARG_TIMEOUT])
         g_Timeout = *(ULONG *)args[ARG_TIMEOUT];
 

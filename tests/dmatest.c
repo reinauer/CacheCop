@@ -3,7 +3,7 @@
  * CachePostDMA() sequences.
  *
  *   dmatest ALL | OK | CHUNKS | LEAK | NOPRE | NOCONT | DIR | SHORT |
- *           LENGTH | INSIDE | OVERLAP | INT | STRESS
+ *           LENGTH | INSIDE | POSTCONT | OVERLAP | INT | STRESS
  *
  * Each case prints what it does; compare with "cachecop status" and
  * "cachecop events". Leaked transfers point into a buffer that is never
@@ -95,16 +95,23 @@ static void t_short(void)
 
 static void t_length(void)
 {
-    Printf("LENGTH: post length differs from pre (STRICT only)\n");
+    Printf("LENGTH: post length differs from pre\n");
     pre(0x6000, 512, 0);
     post(0x6000, 256, 0);
 }
 
 static void t_inside(void)
 {
-    Printf("INSIDE: post address inside the transfer, not at its start (STRICT only)\n");
+    Printf("INSIDE: post address inside the transfer, not at its start\n");
     pre(0x7000, 512, 0);
     post(0x7100, 256, 0);
+}
+
+static void t_postcont(void)
+{
+    Printf("POSTCONT: post with DMA_Continue (closes the transfer anyway)\n");
+    pre(0xB000, 512, 0);
+    post(0xB000, 512, DMA_Continue);
 }
 
 static void t_overlap(void)
@@ -161,6 +168,7 @@ static const struct {
     { "OK", t_ok }, { "CHUNKS", t_chunks }, { "LEAK", t_leak },
     { "NOPRE", t_nopre }, { "NOCONT", t_nocont }, { "DIR", t_dir },
     { "SHORT", t_short }, { "LENGTH", t_length }, { "INSIDE", t_inside },
+    { "POSTCONT", t_postcont },
     { "OVERLAP", t_overlap }, { "INT", t_int }, { "STRESS", t_stress },
 };
 
@@ -170,7 +178,7 @@ int main(int argc, char **argv)
     BOOL all, ran = FALSE;
 
     if (argc < 2) {
-        Printf("Usage: dmatest ALL|OK|CHUNKS|LEAK|NOPRE|NOCONT|DIR|SHORT|LENGTH|INSIDE|OVERLAP|INT|STRESS\n");
+        Printf("Usage: dmatest ALL|OK|CHUNKS|LEAK|NOPRE|NOCONT|DIR|SHORT|LENGTH|INSIDE|POSTCONT|OVERLAP|INT|STRESS\n");
         return RETURN_FAIL;
     }
     /* Never freed: leaked transfers must keep pointing at valid memory */
