@@ -100,3 +100,21 @@ _cc_SerPutStr:
 .Lser_done:
         movem.l (sp)+,a2/a6
         rts
+
+| const char *cc_SegFind(APTR find, APTR addr, ULONG *hunk, ULONG *offset)
+| Call SegTracker's seg_Find (a0 = address, a1 = &hunk, a2 = &offset,
+| returns the segment name or NULL in d0). Call under Forbid().
+        .globl  _cc_SegFind
+_cc_SegFind:
+        movem.l a2/a6,-(sp)
+        move.l  12(sp),d1               | find
+        movea.l 16(sp),a0               | addr
+        movea.l 20(sp),a1               | &hunk
+        movea.l 24(sp),a2               | &offset
+        movea.l _SysBase,a6
+        pea     .Lseg_ret(pc)
+        move.l  d1,-(sp)
+        rts
+.Lseg_ret:
+        movem.l (sp)+,a2/a6
+        rts

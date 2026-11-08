@@ -14,6 +14,9 @@
 #include <exec/ports.h>
 #include <exec/memory.h>
 #include <exec/tasks.h>
+#include <exec/resident.h>
+#include <exec/semaphores.h>
+#include <libraries/configvars.h>
 #include <dos/dos.h>
 #include <dos/dosextens.h>
 #include <dos/rdargs.h>
@@ -21,6 +24,8 @@
 
 #include <proto/exec.h>
 #include <proto/dos.h>
+#define EXPANSION_BASE_NAME g_ExpansionBase
+#include <proto/expansion.h>
 
 #include <string.h>
 #include <stdarg.h>
@@ -514,6 +519,124 @@ static BOOL check_stale(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Naming code addresses (task context only)                          */
+/* ------------------------------------------------------------------ */
+
+static struct Library *g_ExpansionBase;
+
+static void fmt(char *buf, const char *f, ...);
+
+/* SegTracker (from the Enforcer package) publishes this semaphore */
+struct SegSem {
+    struct SignalSemaphore seg_Semaphore;
+    APTR                   seg_Find;
+};
+
+const char *cc_SegFind(APTR find, APTR addr, ULONG *hunk, ULONG *offset);
+
+#define CC_WHERELEN 48
+
+static void copy_tail(char *dst, const char *src, ULONG size)
+{
+    ULONG len = strlen(src);
+
+    /* Keep the end of long paths: the file name is what matters */
+    if (len >= size)
+        src += len - (size - 1);
+    strcpy(dst, src);
+}
+
+/* Loaded code: ask SegTracker */
+static BOOL where_segtracker(char *buf, APTR pc)
+{
+    struct SegSem *ss;
+    const char *name = NULL;
+    ULONG hunk = 0, off = 0;
+    char tmp[CC_WHERELEN];
+
+    Forbid();
+    ss = (struct SegSem *)FindSemaphore((CONST_STRPTR)"SegTracker");
+    if (ss && ss->seg_Find) {
+        name = cc_SegFind(ss->seg_Find, pc, &hunk, &off);
+        if (name)
+            copy_tail(tmp, name, CC_WHERELEN - 20);
+    }
+    Permit();
+    if (!name)
+        return FALSE;
+    fmt(buf, "%s:%lu+$%lx", (ULONG)tmp, hunk, off);
+    return TRUE;
+}
+
+/*
+ * Resident modules (Kickstart ROM and kicked modules): take the closest
+ * RomTag at or below pc. rt_EndSkip normally marks the end of the module.
+ * In the Kickstart ROM, where modules sit back to back, a pc past it is
+ * still attributed to the preceding module, marked with '?'.
+ */
+static BOOL in_kickstart(APTR pc)
+{
+    ULONG a = (ULONG)pc;
+    return (a >= 0xF80000UL && a < 0x1000000UL) ||   /* main ROM */
+           (a >= 0xE00000UL && a < 0xE80000UL);      /* extended ROM */
+}
+
+static BOOL where_resident(char *buf, APTR pc)
+{
+    ULONG *rm = (ULONG *)SysBase->ResModules;
+    struct Resident *best = NULL;
+    char tmp[CC_WHERELEN];
+
+    while (rm && *rm) {
+        struct Resident *r;
+
+        if (*rm & 0x80000000UL) {        /* link to another array */
+            rm = (ULONG *)(*rm & 0x7fffffffUL);
+            continue;
+        }
+        r = (struct Resident *)*rm++;
+        if ((APTR)r <= pc && (!best || r > best))
+            best = r;
+    }
+    if (!best || !best->rt_Name)
+        return FALSE;
+    if (pc >= best->rt_EndSkip && !(in_kickstart(pc) && in_kickstart(best)))
+        return FALSE;
+    copy_tail(tmp, best->rt_Name, CC_WHERELEN - 16);
+    fmt(buf, "%s+$%lx%s", (ULONG)tmp, (ULONG)((UBYTE *)pc - (UBYTE *)best),
+        (ULONG)(pc >= best->rt_EndSkip ? "?" : ""));
+    return TRUE;
+}
+
+/* Code running from an expansion board's ROM (not from a RAM board) */
+static BOOL where_board(char *buf, APTR pc)
+{
+    struct ConfigDev *cd = NULL;
+
+    if (!g_ExpansionBase)
+        return FALSE;
+    while ((cd = FindConfigDev(cd, -1, -1)) != NULL) {
+        UBYTE *base = cd->cd_BoardAddr;
+        if (cd->cd_Rom.er_Type & ERTF_MEMLIST)
+            continue;
+        if ((UBYTE *)pc >= base && (UBYTE *)pc < base + cd->cd_BoardSize) {
+            fmt(buf, "board %lu/%lu+$%lx",
+                (ULONG)cd->cd_Rom.er_Manufacturer, (ULONG)cd->cd_Rom.er_Product,
+                (ULONG)((UBYTE *)pc - base));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Describe the code at pc, or return FALSE if nothing claims it */
+static BOOL where_is(char *buf, APTR pc)
+{
+    return where_segtracker(buf, pc) || where_board(buf, pc) ||
+           where_resident(buf, pc);
+}
+
+/* ------------------------------------------------------------------ */
 /* Formatting                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -542,7 +665,15 @@ static void flags_str(char *buf, ULONG flags)
 
 static void fmt_caller(char *buf, const struct Caller *c)
 {
-    fmt(buf, "$%08lx %s%s", (ULONG)c->pc,
+    char where[CC_WHERELEN + 4];
+
+    where[0] = '\0';
+    if (where_is(where + 2, c->pc)) {
+        where[0] = ' ';
+        where[1] = '(';
+        strcat(where, ")");
+    }
+    fmt(buf, "$%08lx%s %s%s", (ULONG)c->pc, (ULONG)where,
         (ULONG)(c->name[0] ? c->name : "?"), (ULONG)(c->inint ? " (int)" : ""));
 }
 
@@ -554,7 +685,7 @@ static BOOL is_post_event(UBYTE type)
 
 static void fmt_event(char *buf, const struct Event *ev)
 {
-    char fl[4], who[64];
+    char fl[4], who[128];
 
     if (ev->type == EV_STALE) {
         /* No offending call, just the transfer */
@@ -563,7 +694,7 @@ static void fmt_event(char *buf, const struct Event *ev)
     } else {
         flags_str(fl, ev->flags);
         fmt_caller(who, &ev->who);
-        fmt(buf, "CacheCop [%lus] %s\n  %s $%08lx len $%08lx fl %s by %s\n",
+        fmt(buf, "CacheCop [%lus] %s\n  %s $%08lx len $%lx fl %s by %s\n",
             ev->t, (ULONG)kEventNames[ev->type],
             (ULONG)(is_post_event(ev->type) ? "post" : "pre "),
             (ULONG)ev->addr, ev->len, (ULONG)fl, (ULONG)who);
@@ -573,8 +704,9 @@ static void fmt_event(char *buf, const struct Event *ev)
         flags_str(fl, x->flags);
         fmt_caller(who, &x->who);
         fmt(buf + strlen(buf),
-            "  xfer $%08lx len $%08lx granted $%08lx fl %s by %s at %lus\n",
-            (ULONG)x->start, x->reqlen, x->covered, (ULONG)fl, (ULONG)who, x->t0);
+            "  xfer $%08lx len $%lx granted $%lx fl %s at %lus\n"
+            "       by %s\n",
+            (ULONG)x->start, x->reqlen, x->covered, (ULONG)fl, x->t0, (ULONG)who);
     }
 }
 
@@ -957,7 +1089,7 @@ static ULONG count_violations(const struct Stats *s)
 /* RETURN_WARN if any violation was seen, so scripts can test for it */
 static LONG print_status(void)
 {
-    char buf[CC_LINELEN], who[64], fl[4];
+    char buf[CC_LINELEN], who[128], fl[4];
     struct CCStatus *st;
     const struct Stats *s;
     LONG rc;
@@ -986,15 +1118,14 @@ static LONG print_status(void)
     }
 
     if (st->nxfers) {
-        Printf((CONST_STRPTR)"\nOutstanding transfers (R = from RAM, N = no modify,"
-               " ! = over TIMEOUT):\n");
-        Printf((CONST_STRPTR)"     age  address    requested  granted    chunks fl   caller\n");
+        Printf((CONST_STRPTR)"\nOutstanding transfers (R=from RAM, N=no modify, !=timed out):\n");
         for (i = 0; i < st->nxfers; i++) {
             const struct Xfer *x = &st->xfers[i];
 
             flags_str(fl, x->flags);
             fmt_caller(who, &x->who);
-            fmt(buf, "  %5lus%s $%08lx  $%08lx  $%08lx  %5lu  %s  %s\n",
+            fmt(buf, "  %5lus%s $%08lx len $%lx granted $%lx chunks %lu fl %s\n"
+                "          by %s\n",
                 st->now - x->t0, (ULONG)(x->stale ? "!" : " "),
                 (ULONG)x->start, x->reqlen, x->covered,
                 (ULONG)x->chunks, (ULONG)fl, (ULONG)who);
@@ -1057,11 +1188,13 @@ int main(void)
     const char *cmd;
     LONG rc;
 
+    g_ExpansionBase = OpenLibrary((CONST_STRPTR)"expansion.library", 37);
     rda = ReadArgs((CONST_STRPTR)TEMPLATE, args, NULL);
     if (!rda) {
         PrintFault(IoErr(), (CONST_STRPTR)"CacheCop");
         usage();
-        return RETURN_FAIL;
+        rc = RETURN_FAIL;
+        goto out;
     }
     cmd = (const char *)args[ARG_COMMAND];
     g_Serial = args[ARG_SERIAL] != 0;
@@ -1085,5 +1218,8 @@ int main(void)
     }
 
     FreeArgs(rda);
+out:
+    if (g_ExpansionBase)
+        CloseLibrary(g_ExpansionBase);
     return rc;
 }
