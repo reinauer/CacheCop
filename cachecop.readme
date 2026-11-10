@@ -33,6 +33,7 @@ Usage:
   run cachecop START [SERIAL] [TIMEOUT=n]
   cachecop STATUS      counters, violations, outstanding transfers
   cachecop EVENTS      the last 64 violations in detail
+  cachecop CALLERS     every place that started transfers, with counts
   cachecop RESET       clear counters and the violation log
   cachecop STOP        remove the patches and quit
   cachecop WHERE addr  name the code at an address (e.g. from a log)

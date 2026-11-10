@@ -49,6 +49,7 @@ transfer it relates to, each with:
     run cachecop START [SERIAL] [TIMEOUT=n]
     cachecop STATUS
     cachecop EVENTS
+    cachecop CALLERS
     cachecop RESET
     cachecop STOP
     cachecop WHERE <address>
@@ -62,8 +63,13 @@ transfer it relates to, each with:
 - `STATUS` shows counters, violation counts and every outstanding transfer
   with its age.
 - `EVENTS` shows the last 64 violations in detail.
-- `RESET` clears the counters and the violation log. Outstanding transfers
-  are kept, since their posts are still to come.
+- `CALLERS` lists every code location that started transfers, balanced
+  or not, busiest first: how many, the bytes requested, the directions
+  (`R` from RAM, `W` to RAM) and when it was first and last seen. It tells
+  which drivers use `CachePreDMA()` at all, and whether one you suspect is
+  calling it. Up to 32 locations are kept.
+- `RESET` clears the counters, the callers and the violation log.
+  Outstanding transfers are kept, since their posts are still to come.
 - `STOP` removes the patches and quits.
 - `WHERE <address>` names the code at an address (`$F81234`, `0xF81234`
   or `F81234`), for example a PC from a serial log. It doesn't need
