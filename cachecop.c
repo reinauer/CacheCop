@@ -239,8 +239,19 @@ static void capture_caller(struct Caller *c, APTR pc, APTR sp)
         if (cli) {
             UBYTE *bstr = BADDR(cli->cli_CommandName);
             if (bstr && bstr[0]) {
-                copy_name(c->name, (const char *)bstr + 1, bstr[0]);
-                return;
+                /* The file part: cut to CC_NAMELEN, "Work:C/foo" would
+                   often lose the "foo" */
+                const char *n = (const char *)bstr + 1;
+                ULONG len = bstr[0], i;
+                for (i = 0; i < bstr[0]; i++)
+                    if (bstr[1 + i] == ':' || bstr[1 + i] == '/') {
+                        n = (const char *)bstr + 2 + i;
+                        len = bstr[0] - i - 1;
+                    }
+                if (len) {
+                    copy_name(c->name, n, len);
+                    return;
+                }
             }
         }
     }
