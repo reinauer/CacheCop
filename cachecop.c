@@ -137,6 +137,20 @@ struct Event {
 
 #define CC_MAX_EVENTS 64
 
+/*
+ * Every place that starts transfers, balanced or not, so "cachecop callers"
+ * can tell which drivers use CachePreDMA() at all.
+ */
+#define CC_MAX_SITES 32
+
+struct Site {
+    ULONG  starts;         /* transfers started here; 0 = free slot */
+    ULONG  bytes;          /* their requested lengths, saturating */
+    ULONG  dirs;           /* 1: seen with DMA_ReadFromRAM, 2: without */
+    ULONG  t0, t1;         /* g_Now of the first and the latest start */
+    struct Caller who;     /* the first caller */
+};
+
 struct Stats {
     LONG  active;          /* transfers currently in the table */
     ULONG maxActive;
@@ -144,10 +158,12 @@ struct Stats {
     ULONG continues;       /* CachePreDMA() with DMA_Continue */
     ULONG posts;           /* CachePostDMA() */
     ULONG untracked;       /* starts dropped because the table was full */
+    ULONG unsited;         /* starts from call sites beyond CC_MAX_SITES */
     ULONG events[EV_COUNT];
 };
 
 static struct Xfer  g_Xfers[CC_MAX_XFERS];
+static struct Site  g_Sites[CC_MAX_SITES];
 static struct Stats g_Stats;
 
 /* Event ring: entry n lives at g_Events[n % CC_MAX_EVENTS] */
@@ -358,6 +374,39 @@ static void wake_daemon(void)
         Signal(g_DaemonTask, g_EvSigMask);
 }
 
+/* Count a start at its call site; call under Disable() */
+static void count_site(const struct Caller *who, ULONG len, ULONG flags)
+{
+    struct Site *slot = NULL;
+    ULONG dir = (flags & DMA_ReadFromRAM) ? 1 : 2;
+    ULONG i;
+
+    for (i = 0; i < CC_MAX_SITES; i++) {
+        struct Site *s = &g_Sites[i];
+        if (!s->starts) {
+            if (!slot)
+                slot = s;
+            continue;
+        }
+        if (s->who.pc == who->pc) {
+            s->starts++;
+            s->bytes = s->bytes + len < s->bytes ? 0xFFFFFFFFUL : s->bytes + len;
+            s->dirs |= dir;
+            s->t1 = g_Now;
+            return;
+        }
+    }
+    if (!slot) {
+        g_Stats.unsited++;
+        return;
+    }
+    slot->starts = 1;
+    slot->bytes = len;
+    slot->dirs = dir;
+    slot->t0 = slot->t1 = g_Now;
+    slot->who = *who;
+}
+
 void cc_pre_hook(struct DMAFrame *f, APTR phys)
 {
     struct Caller who;
@@ -372,6 +421,7 @@ void cc_pre_hook(struct DMAFrame *f, APTR phys)
     seq = g_EvSeq;
     if ((f->flags & DMA_Continue) == 0) {
         g_Stats.starts++;
+        count_site(&who, f->len, f->flags);
         x = find_overlap(f->addr, f->len);
         if (x)
             emit(EV_OVERLAP, f->addr, f->len, f->flags, &who, x);
@@ -821,7 +871,7 @@ static void fmt_event(char *buf, const struct Event *ev)
 /* Control messages                                                   */
 /* ------------------------------------------------------------------ */
 
-#define CC_MAGIC 0x43437034UL   /* 'CCp4': bump when the layout changes */
+#define CC_MAGIC 0x43437035UL   /* 'CCp5': bump when the layout changes */
 
 enum {
     CC_CMD_STATUS = 1,
@@ -838,6 +888,8 @@ struct CCStatus {
     ULONG        evseq;    /* events emitted since start */
     ULONG        nevents;  /* most recent events since RESET, oldest first */
     struct Event events[CC_MAX_EVENTS];
+    ULONG        nsites;
+    struct Site  sites[CC_MAX_SITES];
 };
 
 struct CCMsg {
@@ -877,6 +929,14 @@ static void snapshot(struct CCStatus *st)
         Enable();
     }
 
+    st->nsites = 0;
+    for (i = 0; i < CC_MAX_SITES; i++) {
+        Disable();
+        if (g_Sites[i].starts)
+            st->sites[st->nsites++] = g_Sites[i];
+        Enable();
+    }
+
     first = st->evseq > CC_MAX_EVENTS ? st->evseq - CC_MAX_EVENTS : 0;
     if (first < g_EvResetSeq)
         first = g_EvResetSeq;
@@ -897,6 +957,7 @@ static void reset_stats(void)
     /* Outstanding transfers stay: their posts are still to come */
     Disable();
     memset(&g_Stats, 0, sizeof(g_Stats));
+    memset(g_Sites, 0, sizeof(g_Sites));
     for (i = 0; i < CC_MAX_XFERS; i++)
         if (g_Xfers[i].used)
             g_Stats.active++;
@@ -943,6 +1004,35 @@ static void resolve_xfers(void)
             x->who.pc == c.pc) {
             strcpy(x->who.where, c.where);
             x->who.resolved = 1;
+        }
+        Enable();
+    }
+}
+
+/* Name new call sites, while their code is loaded */
+static void resolve_sites(void)
+{
+    ULONG i;
+
+    for (i = 0; i < CC_MAX_SITES; i++) {
+        struct Site *s = &g_Sites[i];
+        struct Caller c;
+        BOOL need;
+
+        Disable();
+        need = s->starts && !s->who.resolved;
+        if (need)
+            c = s->who;
+        Enable();
+        if (!need)
+            continue;
+
+        resolve(&c);
+
+        Disable();
+        if (s->starts && !s->who.resolved && s->who.pc == c.pc) {
+            strcpy(s->who.where, c.where);
+            s->who.resolved = 1;
         }
         Enable();
     }
@@ -1080,6 +1170,7 @@ static VOID loop_until_stop(struct Timer *timer)
         if ((sigs & timersig) && timer_tick(timer)) {
             g_Now++;
             resolve_xfers();
+            resolve_sites();
             if (check_stale())
                 drain_events();
         }
@@ -1330,6 +1421,45 @@ static LONG print_status(BOOL full)
     return rc;
 }
 
+/* Every call site that started transfers, busiest first */
+static LONG print_callers(void)
+{
+    static const char *const dirs[4] = { "", "R  ", "  W", "R+W" };
+    char buf[CC_LINELEN], who[128];
+    UBYTE done[CC_MAX_SITES];
+    struct CCStatus *st;
+    LONG rc;
+    ULONG i, j;
+
+    st = get_status(&rc);
+    if (!st)
+        return rc;
+    Printf((CONST_STRPTR)"CacheCop callers after %lus: %lu site(s), %lu start(s)"
+           " (R=from RAM, W=to RAM)\n", st->now, st->nsites, st->stats.starts);
+    memset(done, 0, sizeof(done));
+    for (i = 0; i < st->nsites; i++) {
+        const struct Site *s;
+        ULONG best = CC_MAX_SITES;
+
+        for (j = 0; j < st->nsites; j++)
+            if (!done[j] && (best == CC_MAX_SITES ||
+                             st->sites[j].starts > st->sites[best].starts))
+                best = j;
+        done[best] = 1;
+        s = &st->sites[best];
+        fmt_caller(who, &s->who);
+        fmt(buf, "  %8lu starts %10lu bytes %s  %lus-%lus\n           by %s\n",
+            s->starts, s->bytes, (ULONG)dirs[s->dirs & 3],
+            s->t0, s->t1, (ULONG)who);
+        PutStr((CONST_STRPTR)buf);
+    }
+    if (st->stats.unsited)
+        Printf((CONST_STRPTR)"  %lu start(s) from further sites not counted\n",
+               st->stats.unsited);
+    FreeVec(st);
+    return RETURN_OK;
+}
+
 static LONG print_events(void)
 {
     char buf[CC_LINELEN];
@@ -1416,6 +1546,8 @@ static VOID usage(void)
         "  STATUS [FULL]  show counters, violations and outstanding transfers\n"
         "          by caller; FULL lists every transfer\n"
         "  EVENTS  show the most recent violations in detail\n"
+        "  CALLERS list every place that started transfers, with counts,\n"
+        "          to see which drivers use CachePreDMA() at all\n"
         "  RESET   clear the counters and the violation log\n"
         "  STOP    remove the patches and quit\n"
         "  WHERE <address>  name the code at an address\n"
@@ -1449,6 +1581,8 @@ int main(void)
                           !stricmp((const char *)args[ARG_ARG], "full"));
     else if (!stricmp(cmd, "events"))
         rc = print_events();
+    else if (!stricmp(cmd, "callers"))
+        rc = print_callers();
     else if (!stricmp(cmd, "reset"))
         rc = send_cmd(CC_CMD_RESET, NULL);
     else if (!stricmp(cmd, "stop"))
